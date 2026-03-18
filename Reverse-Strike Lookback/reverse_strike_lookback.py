@@ -7,14 +7,26 @@ From the article and lookback.txt:
 - Pricing via generic lookback decomposition:
   Vc = m(x, y, τ) - m(x, min(y, k), τ),  Vp = M(x, max(z, k), τ) - M(x, z, τ)
   with m = x - C_y - D⁻_y,  M = x + P_z + D⁺_z (European C/P and lookback premium D with dividend).
+- Near b = r - δ = 0, generic m/M switch to explicit finite-limit formulas to avoid the singular α/β decomposition.
 - Supports optional current extremum L (y for call, z for put) and continuous dividend yield δ.
+BGK continuity correction is intentionally not wrapped here: reverse-strike structures
+need product-specific discrete-to-continuous handling.
 """
 
-from math import log, sqrt, exp
-from typing import Optional
+from math import log, sqrt, exp, erf, pi
+from typing import Callable, Optional
 from dataclasses import dataclass
 
 import numpy as np
+
+_B_ZERO_EPS = 1e-5
+
+
+@dataclass
+class OptionGreeks:
+    delta: float
+    gamma: float
+    vega: float
 
 
 def norm_cdf(x: float) -> float:
@@ -23,10 +35,46 @@ def norm_cdf(x: float) -> float:
         from scipy.stats import norm
         return float(norm.cdf(x))
     except ImportError:
-        a1, a2, a3, a4, a5 = 0.31938153, -0.356563782, 1.781477937, -1.821255978, 1.330274429
-        t = 1.0 / (1.0 + 0.2316419 * abs(x))
-        n = (a1 * t + a2 * t**2 + a3 * t**3 + a4 * t**4 + a5 * t**5) * exp(-x * x / 2) / sqrt(2 * 3.141592653589793)
-        return 1 - n if x < 0 else n
+        return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+
+
+def norm_pdf(x: float) -> float:
+    """Probability density function of the standard normal."""
+    return exp(-0.5 * x * x) / sqrt(2.0 * pi)
+
+
+def _finite_difference_greeks(
+    pricer: Callable[[float, float], float],
+    S0: float,
+    sigma: float,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    if S0 <= 0:
+        raise ValueError("S0 must be positive for finite-difference Greeks")
+    if sigma <= 0:
+        raise ValueError("sigma must be positive for finite-difference Greeks")
+    bump_s = max(1e-4 * S0, 1e-6) if dS is None else dS
+    if bump_s <= 0:
+        raise ValueError("dS must be positive")
+    bump_sigma = max(1e-4 * sigma, 1e-6) if dSigma is None else dSigma
+    if bump_sigma <= 0:
+        raise ValueError("dSigma must be positive")
+    if bump_sigma >= sigma:
+        bump_sigma = 0.5 * sigma
+    if bump_sigma <= 0:
+        raise ValueError("dSigma is too large relative to sigma")
+
+    v0 = pricer(S0, sigma)
+    v_up = pricer(S0 + bump_s, sigma)
+    v_dn = pricer(S0 - bump_s, sigma)
+    delta = (v_up - v_dn) / (2.0 * bump_s)
+    gamma = (v_up - 2.0 * v0 + v_dn) / (bump_s * bump_s)
+
+    vega_up = pricer(S0, sigma + bump_sigma)
+    vega_dn = pricer(S0, sigma - bump_sigma)
+    vega = (vega_up - vega_dn) / (2.0 * bump_sigma)
+    return OptionGreeks(delta=delta, gamma=gamma, vega=vega)
 
 
 # -----------------------------------------------------------------------------
@@ -99,7 +147,7 @@ def _B_plus_image(x: float, xi: float, tau: float, r: float, b: float, sigma: fl
     """*B^+_ξ = (ξ/x)^β e^{-rτ} N(bar{d}'_ξ)."""
     if x <= 0 or xi <= 0:
         return 0.0
-    return (xi / x) ** beta * exp(-r * tau) * norm_cdf(_bar_d_prime_xi(x, xi, tau, b, sigma))
+    return exp(beta * log(xi / x)) * exp(-r * tau) * norm_cdf(_bar_d_prime_xi(x, xi, tau, b, sigma))
 
 
 def _D_minus(x: float, xi: float, tau: float, r: float, delta: float, sigma: float) -> float:
@@ -120,7 +168,7 @@ def _B_minus_image(x: float, xi: float, tau: float, r: float, b: float, sigma: f
     """*B^-_ξ = (ξ/x)^β e^{-rτ} N(-bar{d}'_ξ)."""
     if x <= 0 or xi <= 0:
         return 0.0
-    return (xi / x) ** beta * exp(-r * tau) * norm_cdf(-_bar_d_prime_xi(x, xi, tau, b, sigma))
+    return exp(beta * log(xi / x)) * exp(-r * tau) * norm_cdf(-_bar_d_prime_xi(x, xi, tau, b, sigma))
 
 
 def _D_plus(x: float, xi: float, tau: float, r: float, delta: float, sigma: float) -> float:
@@ -140,6 +188,19 @@ def _generic_min_value(S0: float, y: float, T: float, r: float, delta: float, si
     """Value of contract that pays the minimum at expiry: m = x - C_y - D⁻_y."""
     if T <= 0:
         return min(S0, y)
+    b = r - delta
+    if abs(b) <= _B_ZERO_EPS:
+        # Exact b -> 0 limit (Buchen-Konstandatos / L'Hopital branch):
+        # m(x,y,tau) = e^{-r tau}[ y N(d') + x N(-d) + sigma*sqrt(tau)*x*(d*N(-d) - phi(d)) ].
+        sqrt_tau = sqrt(T)
+        d = (log(S0 / y) / (sigma * sqrt_tau)) + 0.5 * sigma * sqrt_tau
+        d_prime = d - sigma * sqrt_tau
+        disc = exp(-r * T)
+        return disc * (
+            y * norm_cdf(d_prime)
+            + S0 * norm_cdf(-d)
+            + sigma * sqrt_tau * S0 * (d * norm_cdf(-d) - norm_pdf(d))
+        )
     C_y = _european_call(S0, y, T, r, sigma, delta)
     D_minus = _D_minus(S0, y, T, r, delta, sigma)
     return S0 - C_y - D_minus
@@ -149,6 +210,18 @@ def _generic_max_value(S0: float, z: float, T: float, r: float, delta: float, si
     """Value of contract that pays the maximum at expiry: M = x + P_z + D⁺_z."""
     if T <= 0:
         return max(S0, z)
+    b = r - delta
+    if abs(b) <= _B_ZERO_EPS:
+        # Symmetric exact b -> 0 counterpart for maximum-paying contract.
+        sqrt_tau = sqrt(T)
+        d = (log(S0 / z) / (sigma * sqrt_tau)) + 0.5 * sigma * sqrt_tau
+        d_prime = d - sigma * sqrt_tau
+        disc = exp(-r * T)
+        return disc * (
+            z * norm_cdf(-d_prime)
+            + S0 * norm_cdf(d)
+            + sigma * sqrt_tau * S0 * (d * norm_cdf(d) + norm_pdf(d))
+        )
     P_z = _european_put(S0, z, T, r, sigma, delta)
     D_plus = _D_plus(S0, z, T, r, delta, sigma)
     return S0 + P_z + D_plus
@@ -224,6 +297,38 @@ def reverse_strike_lookback_put(
     return M_max_z_k - M_z
 
 
+def reverse_strike_lookback_call_greeks(
+    S0: float,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    delta: float = 0.0,
+    L: Optional[float] = None,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for reverse_strike_lookback_call."""
+    pricer = lambda spot, vol: reverse_strike_lookback_call(spot, K, T, r, vol, delta=delta, L=L)
+    return _finite_difference_greeks(pricer, S0, sigma, dS=dS, dSigma=dSigma)
+
+
+def reverse_strike_lookback_put_greeks(
+    S0: float,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    delta: float = 0.0,
+    L: Optional[float] = None,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for reverse_strike_lookback_put."""
+    pricer = lambda spot, vol: reverse_strike_lookback_put(spot, K, T, r, vol, delta=delta, L=L)
+    return _finite_difference_greeks(pricer, S0, sigma, dS=dS, dSigma=dSigma)
+
+
 # -----------------------------------------------------------------------------
 # Monte Carlo: path simulation and pricers
 # -----------------------------------------------------------------------------
@@ -247,6 +352,7 @@ def _simulate_paths(
     S = np.full(n_paths, S0)
     S_min = np.full(n_paths, S0)
     S_max = np.full(n_paths, S0)
+    # Discrete monitoring of extrema; closed-form lookback formulas assume continuous monitoring.
     for i in range(n_steps):
         log_S += drift * dt + sigma * sqrt(dt) * Z[i]
         S = S0 * np.exp(log_S)

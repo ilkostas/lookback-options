@@ -13,9 +13,18 @@ From lookback.txt:
   Put:  Condition 1 K <= L (asset has not fallen below strike); Condition 2 K > L (already ITM).
 """
 
-from math import log, sqrt, exp
-from typing import Optional
+from math import log, sqrt, exp, erf
+from typing import Callable, Optional
 from dataclasses import dataclass
+
+_BGK_BETA1 = 0.5826
+
+
+@dataclass
+class OptionGreeks:
+    delta: float
+    gamma: float
+    vega: float
 
 
 def norm_cdf(x: float) -> float:
@@ -24,13 +33,46 @@ def norm_cdf(x: float) -> float:
         from scipy.stats import norm
         return float(norm.cdf(x))
     except ImportError:
-        # Fallback: Abramowitz & Stegun approximation
-        a1, a2, a3, a4, a5 = 0.31938153, -0.356563782, 1.781477937, -1.821255978, 1.330274429
-        t = 1.0 / (1.0 + 0.2316419 * abs(x))
-        n = (a1 * t + a2 * t**2 + a3 * t**3 + a4 * t**4 + a5 * t**5) * exp(-x * x / 2) / sqrt(2 * 3.141592653589793)
-        # Abramowitz & Stegun approximation: n → 0 as |x| → ∞,
-        # so Φ(x) = 1 - n for x ≥ 0 and Φ(x) = n for x < 0.
-        return 1 - n if x >= 0 else n
+        return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+
+
+def _validate_monitoring_points(monitoring_points: int) -> None:
+    if monitoring_points <= 0:
+        raise ValueError("monitoring_points must be a positive integer")
+
+
+def _finite_difference_greeks(
+    pricer: Callable[[float, float], float],
+    S0: float,
+    sigma: float,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    if S0 <= 0:
+        raise ValueError("S0 must be positive for finite-difference Greeks")
+    if sigma <= 0:
+        raise ValueError("sigma must be positive for finite-difference Greeks")
+    bump_s = max(1e-4 * S0, 1e-6) if dS is None else dS
+    if bump_s <= 0:
+        raise ValueError("dS must be positive")
+    bump_sigma = max(1e-4 * sigma, 1e-6) if dSigma is None else dSigma
+    if bump_sigma <= 0:
+        raise ValueError("dSigma must be positive")
+    if bump_sigma >= sigma:
+        bump_sigma = 0.5 * sigma
+    if bump_sigma <= 0:
+        raise ValueError("dSigma is too large relative to sigma")
+
+    v0 = pricer(S0, sigma)
+    v_up = pricer(S0 + bump_s, sigma)
+    v_dn = pricer(S0 - bump_s, sigma)
+    delta = (v_up - v_dn) / (2.0 * bump_s)
+    gamma = (v_up - 2.0 * v0 + v_dn) / (bump_s * bump_s)
+
+    vega_up = pricer(S0, sigma + bump_sigma)
+    vega_dn = pricer(S0, sigma - bump_sigma)
+    vega = (vega_up - vega_dn) / (2.0 * bump_sigma)
+    return OptionGreeks(delta=delta, gamma=gamma, vega=vega)
 
 
 # -----------------------------------------------------------------------------
@@ -86,13 +128,14 @@ def fixed_strike_lookback_call(
     term1 = S0 * exp(-delta * T) * norm_cdf(_d1)
     term2 = K * exp(-r * T) * norm_cdf(_d2)
     expo = -2 * b / (sigma**2)
+    log_ratio = log(S0 / K)
     if abs(b) < 1e-12:
         term3 = 0.5 * (sigma**2) * T * S0 * (norm_cdf(-_d3) - exp(-r * T) * norm_cdf(-_d2))
     else:
         # b ≠ 0: use the standard closed-form term that smoothly
         # connects to the b → 0 limit above.
         term3 = S0 * (sigma**2 / (2 * b)) * (
-            exp(-delta * T) * norm_cdf(_d1) - (S0 / K) ** expo * exp(-r * T) * norm_cdf(_d3)
+            exp(-delta * T) * norm_cdf(_d1) - exp(expo * log_ratio) * exp(-r * T) * norm_cdf(_d3)
         )
     return term1 - term2 + term3
 
@@ -131,15 +174,98 @@ def fixed_strike_lookback_put(
     term1 = K * exp(-r * T) * norm_cdf(-_d2)
     term2 = S0 * exp(-delta * T) * norm_cdf(-_d1)
     expo = -2 * b / (sigma**2)
+    log_ratio = log(S0 / K)
     if abs(b) < 1e-12:
         term3 = 0.5 * (sigma**2) * T * S0 * (-norm_cdf(_d3) + exp(-r * T) * norm_cdf(_d2))
     else:
         # b ≠ 0: use the standard closed-form term that smoothly
         # connects to the b → 0 limit above.
         term3 = S0 * (sigma**2 / (2 * b)) * (
-            (S0 / K) ** expo * exp(-r * T) * norm_cdf(-_d3) - exp(-delta * T) * norm_cdf(-_d1)
+            exp(expo * log_ratio) * exp(-r * T) * norm_cdf(-_d3) - exp(-delta * T) * norm_cdf(-_d1)
         )
     return term1 - term2 + term3
+
+
+# -----------------------------------------------------------------------------
+# BGK continuity correction (discrete-monitoring proxy for continuous formulas)
+# -----------------------------------------------------------------------------
+
+def fixed_strike_lookback_call_bgk(
+    S0: float,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    monitoring_points: int,
+    delta: float = 0.0,
+    L: Optional[float] = None,
+) -> float:
+    """
+    BGK-corrected fixed-strike call approximation (Broadie-Glasserman-Kou, Theorem 4).
+    """
+    _validate_monitoring_points(monitoring_points)
+    if T <= 0:
+        return fixed_strike_lookback_call(S0, K, T, r, sigma, delta=delta, L=L)
+    corr = _BGK_BETA1 * sigma * sqrt(T / monitoring_points)
+    eta = exp(corr)
+    l_adjusted = None if L is None else L * eta
+    v_cont = fixed_strike_lookback_call(S0 * eta, K * eta, T, r, sigma, delta=delta, L=l_adjusted)
+    return exp(-corr) * v_cont
+
+
+def fixed_strike_lookback_put_bgk(
+    S0: float,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    monitoring_points: int,
+    delta: float = 0.0,
+    L: Optional[float] = None,
+) -> float:
+    """
+    BGK-corrected fixed-strike put approximation (Broadie-Glasserman-Kou, Theorem 4).
+    """
+    _validate_monitoring_points(monitoring_points)
+    if T <= 0:
+        return fixed_strike_lookback_put(S0, K, T, r, sigma, delta=delta, L=L)
+    corr = _BGK_BETA1 * sigma * sqrt(T / monitoring_points)
+    eta = exp(-corr)
+    l_adjusted = None if L is None else L * eta
+    v_cont = fixed_strike_lookback_put(S0 * eta, K * eta, T, r, sigma, delta=delta, L=l_adjusted)
+    return exp(corr) * v_cont
+
+
+def fixed_strike_lookback_call_greeks(
+    S0: float,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    delta: float = 0.0,
+    L: Optional[float] = None,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for fixed_strike_lookback_call."""
+    pricer = lambda spot, vol: fixed_strike_lookback_call(spot, K, T, r, vol, delta=delta, L=L)
+    return _finite_difference_greeks(pricer, S0, sigma, dS=dS, dSigma=dSigma)
+
+
+def fixed_strike_lookback_put_greeks(
+    S0: float,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    delta: float = 0.0,
+    L: Optional[float] = None,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for fixed_strike_lookback_put."""
+    pricer = lambda spot, vol: fixed_strike_lookback_put(spot, K, T, r, vol, delta=delta, L=L)
+    return _finite_difference_greeks(pricer, S0, sigma, dS=dS, dSigma=dSigma)
 
 
 # -----------------------------------------------------------------------------

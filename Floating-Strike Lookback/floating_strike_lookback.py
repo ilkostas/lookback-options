@@ -8,9 +8,18 @@ From lookback.txt:
 - Auxiliary d_1, d_2, d_3 as in lookback.txt (with δ). Supports δ ≠ 0 and optional L.
 """
 
-from math import log, sqrt, exp
-from typing import Optional
+from math import log, sqrt, exp, erf
+from typing import Callable, Optional
 from dataclasses import dataclass
+
+_BGK_BETA1 = 0.5826
+
+
+@dataclass
+class OptionGreeks:
+    delta: float
+    gamma: float
+    vega: float
 
 
 def norm_cdf(x: float) -> float:
@@ -19,15 +28,51 @@ def norm_cdf(x: float) -> float:
         from scipy.stats import norm
         return float(norm.cdf(x))
     except ImportError:
-        a1, a2, a3, a4, a5 = 0.31938153, -0.356563782, 1.781477937, -1.821255978, 1.330274429
-        t = 1.0 / (1.0 + 0.2316419 * abs(x))
-        n = (a1 * t + a2 * t**2 + a3 * t**3 + a4 * t**4 + a5 * t**5) * exp(-x * x / 2) / sqrt(2 * 3.141592653589793)
-        return 1 - n if x < 0 else n
+        return 0.5 * (1.0 + erf(x / sqrt(2.0)))
 
 
 def norm_pdf(x: float) -> float:
     """Probability density function of the standard normal N(d)."""
     return exp(-x * x / 2.0) / sqrt(2.0 * 3.141592653589793)
+
+
+def _validate_monitoring_points(monitoring_points: int) -> None:
+    if monitoring_points <= 0:
+        raise ValueError("monitoring_points must be a positive integer")
+
+
+def _finite_difference_greeks(
+    pricer: Callable[[float, float], float],
+    S0: float,
+    sigma: float,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    if S0 <= 0:
+        raise ValueError("S0 must be positive for finite-difference Greeks")
+    if sigma <= 0:
+        raise ValueError("sigma must be positive for finite-difference Greeks")
+    bump_s = max(1e-4 * S0, 1e-6) if dS is None else dS
+    if bump_s <= 0:
+        raise ValueError("dS must be positive")
+    bump_sigma = max(1e-4 * sigma, 1e-6) if dSigma is None else dSigma
+    if bump_sigma <= 0:
+        raise ValueError("dSigma must be positive")
+    if bump_sigma >= sigma:
+        bump_sigma = 0.5 * sigma
+    if bump_sigma <= 0:
+        raise ValueError("dSigma is too large relative to sigma")
+
+    v0 = pricer(S0, sigma)
+    v_up = pricer(S0 + bump_s, sigma)
+    v_dn = pricer(S0 - bump_s, sigma)
+    delta = (v_up - v_dn) / (2.0 * bump_s)
+    gamma = (v_up - 2.0 * v0 + v_dn) / (bump_s * bump_s)
+
+    vega_up = pricer(S0, sigma + bump_sigma)
+    vega_dn = pricer(S0, sigma - bump_sigma)
+    vega = (vega_up - vega_dn) / (2.0 * bump_sigma)
+    return OptionGreeks(delta=delta, gamma=gamma, vega=vega)
 
 
 # -----------------------------------------------------------------------------
@@ -70,11 +115,14 @@ def floating_strike_lookback_call(
         raise ValueError("Time to maturity T must be non-negative")
     if sigma <= 0:
         raise ValueError("Volatility sigma must be positive")
+    if L is not None and L > S0:
+        raise ValueError("For floating-strike call, running minimum L must satisfy L <= S0")
     if T <= 0:
         return max(S0 - (L if L is not None else S0), 0.0)
     L_use = S0 if L is None else L
     b = r - delta
     expo = 2.0 * b / (sigma**2)
+    log_ratio = log(L_use / S0)
     sqrt_T = sqrt(T)
     _d1 = (log(S0 / L_use) + (b + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
     _d2 = _d1 - sigma * sqrt_T
@@ -91,7 +139,7 @@ def floating_strike_lookback_call(
             * S0
             * (
                 disc_div * norm_cdf(-_d1)
-                - disc_rf * (L_use / S0) ** expo * norm_cdf(-_d3)
+                - disc_rf * exp(expo * log_ratio) * norm_cdf(-_d3)
             )
         )
     else:
@@ -131,11 +179,14 @@ def floating_strike_lookback_put(
         raise ValueError("Time to maturity T must be non-negative")
     if sigma <= 0:
         raise ValueError("Volatility sigma must be positive")
+    if L is not None and L < S0:
+        raise ValueError("For floating-strike put, running maximum L must satisfy L >= S0")
     if T <= 0:
         return max((L if L is not None else S0) - S0, 0.0)
     L_use = S0 if L is None else L
     b = r - delta
     expo = 2.0 * b / (sigma**2)
+    log_ratio = log(L_use / S0)
     sqrt_T = sqrt(T)
     _d1 = (log(S0 / L_use) + (b + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
     _d2 = _d1 - sigma * sqrt_T
@@ -152,7 +203,7 @@ def floating_strike_lookback_put(
             * S0
             * (
                 disc_div * norm_cdf(_d1)
-                - disc_rf * (L_use / S0) ** expo * norm_cdf(_d3)
+                - disc_rf * exp(expo * log_ratio) * norm_cdf(_d3)
             )
         )
     else:
@@ -167,6 +218,93 @@ def floating_strike_lookback_put(
             )
         )
     return put
+
+
+# -----------------------------------------------------------------------------
+# BGK continuity correction (discrete-monitoring proxy for continuous formulas)
+# -----------------------------------------------------------------------------
+
+def floating_strike_lookback_call_bgk(
+    S0: float,
+    T: float,
+    r: float,
+    sigma: float,
+    monitoring_points: int,
+    delta: float = 0.0,
+    L: Optional[float] = None,
+) -> float:
+    """
+    BGK-corrected floating-strike call approximation (Broadie-Glasserman-Kou, 1999).
+    Uses Theorem 2 at inception (L is None), and Theorem 3 for in-progress options.
+    """
+    _validate_monitoring_points(monitoring_points)
+    if T <= 0:
+        return floating_strike_lookback_call(S0, T, r, sigma, delta=delta, L=L)
+    corr = _BGK_BETA1 * sigma * sqrt(T / monitoring_points)
+    eta = exp(corr)
+    if L is None:
+        v_cont = floating_strike_lookback_call(S0, T, r, sigma, delta=delta, L=None)
+        return (v_cont - S0) * (1.0 + corr) + S0
+    l_adjusted = L / eta
+    v_cont = floating_strike_lookback_call(S0, T, r, sigma, delta=delta, L=l_adjusted)
+    return eta * v_cont + (1.0 - eta) * S0
+
+
+def floating_strike_lookback_put_bgk(
+    S0: float,
+    T: float,
+    r: float,
+    sigma: float,
+    monitoring_points: int,
+    delta: float = 0.0,
+    L: Optional[float] = None,
+) -> float:
+    """
+    BGK-corrected floating-strike put approximation (Broadie-Glasserman-Kou, 1999).
+    Uses Theorem 2 at inception (L is None), and Theorem 3 for in-progress options.
+    """
+    _validate_monitoring_points(monitoring_points)
+    if T <= 0:
+        return floating_strike_lookback_put(S0, T, r, sigma, delta=delta, L=L)
+    corr = _BGK_BETA1 * sigma * sqrt(T / monitoring_points)
+    eta = exp(corr)
+    if L is None:
+        v_cont = floating_strike_lookback_put(S0, T, r, sigma, delta=delta, L=None)
+        return (v_cont + S0) * (1.0 - corr) - S0
+    l_adjusted = L * eta
+    v_cont = floating_strike_lookback_put(S0, T, r, sigma, delta=delta, L=l_adjusted)
+    eta_inv = 1.0 / eta
+    return eta_inv * v_cont + (eta_inv - 1.0) * S0
+
+
+def floating_strike_lookback_call_greeks(
+    S0: float,
+    T: float,
+    r: float,
+    sigma: float,
+    delta: float = 0.0,
+    L: Optional[float] = None,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for floating_strike_lookback_call."""
+    pricer = lambda spot, vol: floating_strike_lookback_call(spot, T, r, vol, delta=delta, L=L)
+    return _finite_difference_greeks(pricer, S0, sigma, dS=dS, dSigma=dSigma)
+
+
+def floating_strike_lookback_put_greeks(
+    S0: float,
+    T: float,
+    r: float,
+    sigma: float,
+    delta: float = 0.0,
+    L: Optional[float] = None,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for floating_strike_lookback_put."""
+    pricer = lambda spot, vol: floating_strike_lookback_put(spot, T, r, vol, delta=delta, L=L)
+    return _finite_difference_greeks(pricer, S0, sigma, dS=dS, dSigma=dSigma)
 
 
 # -----------------------------------------------------------------------------

@@ -8,13 +8,22 @@ From lookback.txt (Quanto Lookback, cross-currency drift adjustment):
 - Max exchange rate quanto call: F_max_T * max(S_T - K, 0). Monte Carlo only.
 - Joint quanto fixed-strike call: max(F_c, F_T) * max(S_max_T - K, 0). Monte Carlo only.
 - No L (current extremum); pricing from inception only.
+BGK continuity correction is intentionally not wrapped here: quanto variants need
+product-specific discrete-to-continuous adjustments.
 """
 
-from math import log, sqrt, exp
+from math import log, sqrt, exp, erf
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
+
+
+@dataclass
+class OptionGreeks:
+    delta: float
+    gamma: float
+    vega: float
 
 
 def norm_cdf(x: float) -> float:
@@ -23,15 +32,46 @@ def norm_cdf(x: float) -> float:
         from scipy.stats import norm
         return float(norm.cdf(x))
     except ImportError:
-        a1, a2, a3, a4, a5 = 0.31938153, -0.356563782, 1.781477937, -1.821255978, 1.330274429
-        t = 1.0 / (1.0 + 0.2316419 * abs(x))
-        n = (a1 * t + a2 * t**2 + a3 * t**3 + a4 * t**4 + a5 * t**5) * exp(-x * x / 2) / sqrt(2 * 3.141592653589793)
-        return 1 - n if x < 0 else n
+        return 0.5 * (1.0 + erf(x / sqrt(2.0)))
 
 
 def norm_pdf(x: float) -> float:
     """Probability density function of the standard normal N(d)."""
     return exp(-x * x / 2) / sqrt(2 * 3.141592653589793)
+
+
+def _finite_difference_greeks(
+    pricer: Callable[[float, float], float],
+    S0: float,
+    sigma_asset: float,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    if S0 <= 0:
+        raise ValueError("S0 must be positive for finite-difference Greeks")
+    if sigma_asset <= 0:
+        raise ValueError("sigma_asset must be positive for finite-difference Greeks")
+    bump_s = max(1e-4 * S0, 1e-6) if dS is None else dS
+    if bump_s <= 0:
+        raise ValueError("dS must be positive")
+    bump_sigma = max(1e-4 * sigma_asset, 1e-6) if dSigma is None else dSigma
+    if bump_sigma <= 0:
+        raise ValueError("dSigma must be positive")
+    if bump_sigma >= sigma_asset:
+        bump_sigma = 0.5 * sigma_asset
+    if bump_sigma <= 0:
+        raise ValueError("dSigma is too large relative to sigma_asset")
+
+    v0 = pricer(S0, sigma_asset)
+    v_up = pricer(S0 + bump_s, sigma_asset)
+    v_dn = pricer(S0 - bump_s, sigma_asset)
+    delta = (v_up - v_dn) / (2.0 * bump_s)
+    gamma = (v_up - 2.0 * v0 + v_dn) / (bump_s * bump_s)
+
+    vega_up = pricer(S0, sigma_asset + bump_sigma)
+    vega_dn = pricer(S0, sigma_asset - bump_sigma)
+    vega = (vega_up - vega_dn) / (2.0 * bump_sigma)
+    return OptionGreeks(delta=delta, gamma=gamma, vega=vega)
 
 
 # -----------------------------------------------------------------------------
@@ -55,6 +95,11 @@ def _quanto_r_effective(r_foreign: float, sigma_asset: float, sigma_fx: float, r
     return r_foreign - rho * sigma_asset * sigma_fx
 
 
+def _validate_rho(rho: float) -> None:
+    if not -1.0 <= rho <= 1.0:
+        raise ValueError("Correlation rho must be in [-1, 1]")
+
+
 # -----------------------------------------------------------------------------
 # Standard fixed-rate quanto lookback (closed form, no L)
 # Payoff: F_c * max(S_max_T - K, 0) or F_c * max(K - S_min_T, 0).
@@ -72,11 +117,12 @@ def _fixed_strike_call_std(S0: float, K: float, T: float, r: float, delta: float
     term1 = S0 * exp(-delta * T) * norm_cdf(d1_val)
     term2 = K * exp(-r * T) * norm_cdf(d2_val)
     expo = -2 * b / (sigma**2)
+    log_ratio = log(S0 / K)
     if abs(b) < 1e-12:
         term3 = 0.5 * (sigma**2) * T * S0 * (norm_cdf(-d3_val) - exp(-r * T) * norm_cdf(-d2_val))
     else:
         term3 = (sigma**2 / (2 * b)) * S0 * (
-            (S0 / K) ** expo * norm_cdf(-d3_val) - exp(-r * T) * norm_cdf(-d2_val)
+            exp(expo * log_ratio) * norm_cdf(-d3_val) - exp(-r * T) * norm_cdf(-d2_val)
         )
     return term1 - term2 + term3
 
@@ -101,6 +147,7 @@ def quanto_fixed_strike_lookback_call(
         raise ValueError("Time to maturity T must be non-negative")
     if sigma_asset <= 0 or sigma_fx <= 0:
         raise ValueError("Volatility sigma_asset and sigma_fx must be positive")
+    _validate_rho(rho)
     if T <= 0:
         return quanto_factor * max(S0 - K, 0.0)
     r_eff = _quanto_r_effective(r_foreign, sigma_asset, sigma_fx, rho)
@@ -120,9 +167,10 @@ def _fixed_strike_put_std(S0: float, K: float, T: float, r: float, delta: float,
     term2 = S0 * exp(-delta * T) * norm_cdf(-d1_val)
     b_eff = b if abs(b) >= 1e-12 else (1e-12 if b >= 0 else -1e-12)
     expo = -2 * b_eff / (sigma**2)
+    log_ratio = log(S0 / K)
     term3 = (sigma**2 / (2 * b_eff)) * (
         -S0 * exp(-delta * T) * norm_cdf(-d1_val)
-        + K * exp(-r * T) * (S0 / K) ** expo * norm_cdf(-d3_val)
+        + K * exp(-r * T) * exp(expo * log_ratio) * norm_cdf(-d3_val)
     )
     return term1 - term2 + term3
 
@@ -147,6 +195,7 @@ def quanto_fixed_strike_lookback_put(
         raise ValueError("Time to maturity T must be non-negative")
     if sigma_asset <= 0 or sigma_fx <= 0:
         raise ValueError("Volatility sigma_asset and sigma_fx must be positive")
+    _validate_rho(rho)
     if T <= 0:
         return quanto_factor * max(K - S0, 0.0)
     r_eff = _quanto_r_effective(r_foreign, sigma_asset, sigma_fx, rho)
@@ -171,6 +220,7 @@ def _floating_strike_call_std(S0: float, T: float, r: float, delta: float, sigma
     term1 = S0 * exp(-delta * T) * norm_cdf(d1_val)
     term2 = L_use * exp(-r * T) * norm_cdf(d2_val)
     expo = -2 * b / (sigma**2)
+    log_ratio = log(S0 / L_use)
     if abs(b) < 1e-12:
         term3 = 0.5 * (sigma**2) * S0 * exp(-r * T) * (
             T * norm_cdf(-d1_val) + sqrt(T) / sigma * norm_pdf(d1_val)
@@ -178,7 +228,7 @@ def _floating_strike_call_std(S0: float, T: float, r: float, delta: float, sigma
     else:
         term3 = (sigma**2 / (2 * b)) * S0 * (
             exp(-delta * T) * norm_cdf(-d1_val)
-            - exp(-r * T) * (S0 / L_use) ** expo * norm_cdf(-d3_val)
+            - exp(-r * T) * exp(expo * log_ratio) * norm_cdf(-d3_val)
         )
     return term1 - term2 + term3
 
@@ -202,6 +252,7 @@ def quanto_floating_strike_lookback_call(
         raise ValueError("Time to maturity T must be non-negative")
     if sigma_asset <= 0 or sigma_fx <= 0:
         raise ValueError("Volatility sigma_asset and sigma_fx must be positive")
+    _validate_rho(rho)
     if T <= 0:
         return 0.0
     r_eff = _quanto_r_effective(r_foreign, sigma_asset, sigma_fx, rho)
@@ -222,9 +273,10 @@ def _floating_strike_put_std(S0: float, T: float, r: float, delta: float, sigma:
     term2 = L_use * exp(-r * T) * norm_cdf(-d2_val)
     b_eff = b if abs(b) >= 1e-12 else (1e-12 if b >= 0 else -1e-12)
     expo = -2 * b_eff / (sigma**2)
+    log_ratio = log(S0 / L_use)
     term3 = (sigma**2 / (2 * b_eff)) * S0 * (
         -exp(-delta * T) * norm_cdf(d1_val)
-        + exp(-r * T) * (S0 / L_use) ** expo * norm_cdf(d3_val)
+        + exp(-r * T) * exp(expo * log_ratio) * norm_cdf(d3_val)
     )
     return term1 + term2 + term3
 
@@ -248,11 +300,94 @@ def quanto_floating_strike_lookback_put(
         raise ValueError("Time to maturity T must be non-negative")
     if sigma_asset <= 0 or sigma_fx <= 0:
         raise ValueError("Volatility sigma_asset and sigma_fx must be positive")
+    _validate_rho(rho)
     if T <= 0:
         return 0.0
     r_eff = _quanto_r_effective(r_foreign, sigma_asset, sigma_fx, rho)
     v_std = _floating_strike_put_std(S0, T, r_eff, delta, sigma_asset)
     return quanto_factor * v_std * exp((r_eff - r_domestic) * T)
+
+
+def quanto_fixed_strike_lookback_call_greeks(
+    S0: float,
+    K: float,
+    T: float,
+    r_domestic: float,
+    r_foreign: float,
+    sigma_asset: float,
+    sigma_fx: float,
+    rho: float,
+    quanto_factor: float,
+    delta: float = 0.0,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for quanto_fixed_strike_lookback_call."""
+    pricer = lambda spot, vol: quanto_fixed_strike_lookback_call(
+        spot, K, T, r_domestic, r_foreign, vol, sigma_fx, rho, quanto_factor, delta=delta
+    )
+    return _finite_difference_greeks(pricer, S0, sigma_asset, dS=dS, dSigma=dSigma)
+
+
+def quanto_fixed_strike_lookback_put_greeks(
+    S0: float,
+    K: float,
+    T: float,
+    r_domestic: float,
+    r_foreign: float,
+    sigma_asset: float,
+    sigma_fx: float,
+    rho: float,
+    quanto_factor: float,
+    delta: float = 0.0,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for quanto_fixed_strike_lookback_put."""
+    pricer = lambda spot, vol: quanto_fixed_strike_lookback_put(
+        spot, K, T, r_domestic, r_foreign, vol, sigma_fx, rho, quanto_factor, delta=delta
+    )
+    return _finite_difference_greeks(pricer, S0, sigma_asset, dS=dS, dSigma=dSigma)
+
+
+def quanto_floating_strike_lookback_call_greeks(
+    S0: float,
+    T: float,
+    r_domestic: float,
+    r_foreign: float,
+    sigma_asset: float,
+    sigma_fx: float,
+    rho: float,
+    quanto_factor: float,
+    delta: float = 0.0,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for quanto_floating_strike_lookback_call."""
+    pricer = lambda spot, vol: quanto_floating_strike_lookback_call(
+        spot, T, r_domestic, r_foreign, vol, sigma_fx, rho, quanto_factor, delta=delta
+    )
+    return _finite_difference_greeks(pricer, S0, sigma_asset, dS=dS, dSigma=dSigma)
+
+
+def quanto_floating_strike_lookback_put_greeks(
+    S0: float,
+    T: float,
+    r_domestic: float,
+    r_foreign: float,
+    sigma_asset: float,
+    sigma_fx: float,
+    rho: float,
+    quanto_factor: float,
+    delta: float = 0.0,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for quanto_floating_strike_lookback_put."""
+    pricer = lambda spot, vol: quanto_floating_strike_lookback_put(
+        spot, T, r_domestic, r_foreign, vol, sigma_fx, rho, quanto_factor, delta=delta
+    )
+    return _finite_difference_greeks(pricer, S0, sigma_asset, dS=dS, dSigma=dSigma)
 
 
 # -----------------------------------------------------------------------------
@@ -277,6 +412,7 @@ def _simulate_quanto_paths(
     """Simulate (S_t, F_t) under domestic risk-neutral measure. Returns S_T, S_max, F_T, F_max per path."""
     if rng is None:
         rng = np.random.default_rng()
+    _validate_rho(rho)
     dt = T / n_steps
     drift_S = r_foreign - delta - rho * sigma_asset * sigma_fx
     drift_F = r_domestic - r_foreign
@@ -291,6 +427,7 @@ def _simulate_quanto_paths(
     F_max = np.full(n_paths, F0)
     S = np.full(n_paths, S0)
     F = np.full(n_paths, F0)
+    # Extrema are discretely monitored per step, while closed-form lookback formulas assume continuous monitoring.
     for i in range(n_steps):
         dW_S = sqrt(dt) * Z_S[i]
         dW_F = sqrt(dt) * Z_F[i]

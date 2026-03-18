@@ -12,11 +12,20 @@ Limited risk put (Down-and-Out Put):
 
 Notation: S_0 spot, K strike, T maturity, r rate, δ (delta) continuous dividend yield, σ vol,
 barrier = cut-off level (upper for call, lower for put). Optional M_0 (call) / m_0 (put).
+BGK continuity correction is intentionally not applied here: limited-risk/barrier lookbacks
+need a product-specific discrete-to-continuous correction, not a blanket extremum shift.
 """
 
-from math import log, sqrt, exp
-from typing import Optional
+from math import log, sqrt, exp, erf
+from typing import Callable, Optional
 from dataclasses import dataclass
+
+
+@dataclass
+class OptionGreeks:
+    delta: float
+    gamma: float
+    vega: float
 
 
 def norm_cdf(x: float) -> float:
@@ -25,10 +34,7 @@ def norm_cdf(x: float) -> float:
         from scipy.stats import norm
         return float(norm.cdf(x))
     except ImportError:
-        a1, a2, a3, a4, a5 = 0.31938153, -0.356563782, 1.781477937, -1.821255978, 1.330274429
-        t = 1.0 / (1.0 + 0.2316419 * abs(x))
-        n = (a1 * t + a2 * t**2 + a3 * t**3 + a4 * t**4 + a5 * t**5) * exp(-x * x / 2) / sqrt(2 * 3.141592653589793)
-        return 1 - n if x < 0 else n
+        return 0.5 * (1.0 + erf(x / sqrt(2.0)))
 
 
 # -----------------------------------------------------------------------------
@@ -57,6 +63,40 @@ def _d_m(S: float, m: float, T: float, r: float, delta: float, sigma: float) -> 
 def _lambda_uoc(r: float, delta: float, sigma: float) -> float:
     """Barrier reflection exponent for UOC: (r - δ + σ²/2) / σ²."""
     return (r - delta + 0.5 * sigma**2) / (sigma**2)
+
+
+def _finite_difference_greeks(
+    pricer: Callable[[float, float], float],
+    S0: float,
+    sigma: float,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    if S0 <= 0:
+        raise ValueError("S0 must be positive for finite-difference Greeks")
+    if sigma <= 0:
+        raise ValueError("sigma must be positive for finite-difference Greeks")
+    bump_s = max(1e-4 * S0, 1e-6) if dS is None else dS
+    if bump_s <= 0:
+        raise ValueError("dS must be positive")
+    bump_sigma = max(1e-4 * sigma, 1e-6) if dSigma is None else dSigma
+    if bump_sigma <= 0:
+        raise ValueError("dSigma must be positive")
+    if bump_sigma >= sigma:
+        bump_sigma = 0.5 * sigma
+    if bump_sigma <= 0:
+        raise ValueError("dSigma is too large relative to sigma")
+
+    v0 = pricer(S0, sigma)
+    v_up = pricer(S0 + bump_s, sigma)
+    v_dn = pricer(S0 - bump_s, sigma)
+    delta = (v_up - v_dn) / (2.0 * bump_s)
+    gamma = (v_up - 2.0 * v0 + v_dn) / (bump_s * bump_s)
+
+    vega_up = pricer(S0, sigma + bump_sigma)
+    vega_dn = pricer(S0, sigma - bump_sigma)
+    vega = (vega_up - vega_dn) / (2.0 * bump_sigma)
+    return OptionGreeks(delta=delta, gamma=gamma, vega=vega)
 
 
 def limited_risk_lookback_call(
@@ -89,6 +129,7 @@ def limited_risk_lookback_call(
     m = barrier
     sig_sqrt_T = sigma * sqrt(T)
     lam = _lambda_uoc(r, delta, sigma)
+    log_m_over_s0 = log(m / S0)
     # d_1, d_2 (strike K); x_1, x_2 (barrier m); y_1, y_2 (reflection; y_2 - σ√T gives d' drift)
     d_1 = (log(S0 / K) + (r - delta + 0.5 * sigma**2) * T) / sig_sqrt_T
     d_2 = d_1 - sig_sqrt_T
@@ -104,8 +145,8 @@ def limited_risk_lookback_call(
         - exp(-r * T) * K * (norm_cdf(d_2) - norm_cdf(x_2))
     )
     reflection_penalty = (
-        S0 * exp(-delta * T) * (m / S0) ** (2 * lam) * (norm_cdf(y_1) - norm_cdf(y_2))
-        - exp(-r * T) * K * (m / S0) ** (2 * lam - 2)
+        S0 * exp(-delta * T) * exp((2 * lam) * log_m_over_s0) * (norm_cdf(y_1) - norm_cdf(y_2))
+        - exp(-r * T) * K * exp((2 * lam - 2) * log_m_over_s0)
         * (norm_cdf(y_1 - sig_sqrt_T) - norm_cdf(y_2 - sig_sqrt_T))
     )
     return base_spread_call - reflection_penalty
@@ -147,6 +188,7 @@ def limited_risk_lookback_put(
     m = barrier
     sig_sqrt_T = sigma * sqrt(T)
     lam = _lambda_uoc(r, delta, sigma)
+    log_m_over_s0 = log(m / S0)
     # Use the same distance structure as the call: d_1, d_2; x_1, x_2; y_1, y_2.
     d_1 = (log(S0 / K) + (r - delta + 0.5 * sigma**2) * T) / sig_sqrt_T
     d_2 = d_1 - sig_sqrt_T
@@ -162,11 +204,49 @@ def limited_risk_lookback_put(
         + exp(-r * T) * K * (norm_cdf(-d_2) - norm_cdf(-x_2))
     )
     reflection_penalty = (
-        S0 * exp(-delta * T) * (m / S0) ** (2 * lam) * (norm_cdf(y_1) - norm_cdf(y_2))
-        - exp(-r * T) * K * (m / S0) ** (2 * lam - 2)
+        S0 * exp(-delta * T) * exp((2 * lam) * log_m_over_s0) * (norm_cdf(y_1) - norm_cdf(y_2))
+        - exp(-r * T) * K * exp((2 * lam - 2) * log_m_over_s0)
         * (norm_cdf(y_1 - sig_sqrt_T) - norm_cdf(y_2 - sig_sqrt_T))
     )
     return base_spread_put + reflection_penalty
+
+
+def limited_risk_lookback_call_greeks(
+    S0: float,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    barrier: float,
+    delta: float = 0.0,
+    M_0: Optional[float] = None,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for limited_risk_lookback_call."""
+    pricer = lambda spot, vol: limited_risk_lookback_call(
+        spot, K, T, r, vol, barrier, delta=delta, M_0=M_0
+    )
+    return _finite_difference_greeks(pricer, S0, sigma, dS=dS, dSigma=dSigma)
+
+
+def limited_risk_lookback_put_greeks(
+    S0: float,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    barrier: float,
+    delta: float = 0.0,
+    m_0: Optional[float] = None,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for limited_risk_lookback_put."""
+    pricer = lambda spot, vol: limited_risk_lookback_put(
+        spot, K, T, r, vol, barrier, delta=delta, m_0=m_0
+    )
+    return _finite_difference_greeks(pricer, S0, sigma, dS=dS, dSigma=dSigma)
 
 
 # -----------------------------------------------------------------------------

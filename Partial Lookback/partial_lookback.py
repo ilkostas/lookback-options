@@ -11,10 +11,13 @@ Partial-time (sub-window [0,T_1], expiry T_2):
 - Put:  max over [0,T_1], payoff max(Z_{T_1} - S_{T_2}, 0).
 
 Replication uses Method of Images; α = σ²/(2r), β = 2r/σ² - 1. Dividend: δ=0 only for closed-form; for δ≠0 use Monte Carlo.
+Near b = r - δ = 0, closed-form paths use dedicated finite-limit handling on full prices instead of heuristic α/β substitution.
+BGK continuity correction is intentionally not wrapped here: partial-time/partial-price products
+require product-specific discrete-to-continuous handling.
 """
 
-from math import log, sqrt, exp
-from typing import Optional
+from math import log, sqrt, exp, erf, pi
+from typing import Callable, Optional
 from dataclasses import dataclass
 
 import numpy as np
@@ -26,10 +29,131 @@ def norm_cdf(x: float) -> float:
         from scipy.stats import norm
         return float(norm.cdf(x))
     except ImportError:
-        a1, a2, a3, a4, a5 = 0.31938153, -0.356563782, 1.781477937, -1.821255978, 1.330274429
-        t = 1.0 / (1.0 + 0.2316419 * abs(x))
-        n = (a1 * t + a2 * t**2 + a3 * t**3 + a4 * t**4 + a5 * t**5) * exp(-x * x / 2) / sqrt(2 * 3.141592653589793)
-        return 1 - n if x < 0 else n
+        return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+
+
+_DREZNER_GL_NODES, _DREZNER_GL_WEIGHTS = np.polynomial.legendre.leggauss(20)
+_DREZNER_RHO_EPS = 1e-12
+_DREZNER_EXP_CUTOFF = -80.0
+_B_ZERO_EPS = 1e-8
+
+
+@dataclass
+class OptionGreeks:
+    delta: float
+    gamma: float
+    vega: float
+
+
+def _finite_difference_greeks(
+    pricer: Callable[[float, float], float],
+    S0: float,
+    sigma: float,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    if S0 <= 0:
+        raise ValueError("S0 must be positive for finite-difference Greeks")
+    if sigma <= 0:
+        raise ValueError("sigma must be positive for finite-difference Greeks")
+    bump_s = max(1e-4 * S0, 1e-6) if dS is None else dS
+    if bump_s <= 0:
+        raise ValueError("dS must be positive")
+    bump_sigma = max(1e-4 * sigma, 1e-6) if dSigma is None else dSigma
+    if bump_sigma <= 0:
+        raise ValueError("dSigma must be positive")
+    if bump_sigma >= sigma:
+        bump_sigma = 0.5 * sigma
+    if bump_sigma <= 0:
+        raise ValueError("dSigma is too large relative to sigma")
+
+    v0 = pricer(S0, sigma)
+    v_up = pricer(S0 + bump_s, sigma)
+    v_dn = pricer(S0 - bump_s, sigma)
+    delta = (v_up - v_dn) / (2.0 * bump_s)
+    gamma = (v_up - 2.0 * v0 + v_dn) / (bump_s * bump_s)
+
+    vega_up = pricer(S0, sigma + bump_sigma)
+    vega_dn = pricer(S0, sigma - bump_sigma)
+    vega = (vega_up - vega_dn) / (2.0 * bump_sigma)
+    return OptionGreeks(delta=delta, gamma=gamma, vega=vega)
+
+
+def _sgn(x: float) -> float:
+    return 1.0 if x >= 0 else -1.0
+
+
+def _clip01(x: float) -> float:
+    return min(1.0, max(0.0, x))
+
+
+def _rho_reduced(h: float, k: float, rho: float) -> float:
+    denom_sq = h * h - 2.0 * rho * h * k + k * k
+    if denom_sq <= 0.0:
+        return 0.0
+    reduced = ((rho * h - k) * _sgn(h)) / sqrt(denom_sq)
+    return max(-1.0 + _DREZNER_RHO_EPS, min(1.0 - _DREZNER_RHO_EPS, reduced))
+
+
+def _delta_hk(h: float, k: float) -> float:
+    return (1.0 - _sgn(h) * _sgn(k)) / 4.0
+
+
+def _norm_bivariate_cdf_drezner_core(h: float, k: float, rho: float) -> float:
+    """
+    Gauss-quadrature core for the rho-integral representation of the bivariate normal CDF.
+    """
+    base = norm_cdf(h) * norm_cdf(k)
+    if abs(rho) < 1e-15:
+        return _clip01(base)
+    a = 0.0
+    b = rho
+    half = 0.5 * (b - a)
+    mid = 0.5 * (b + a)
+    acc = 0.0
+    for xi, wi in zip(_DREZNER_GL_NODES, _DREZNER_GL_WEIGHTS):
+        t = half * float(xi) + mid
+        one_minus_t2 = max(1e-16, 1.0 - t * t)
+        expo = -(h * h - 2.0 * t * h * k + k * k) / (2.0 * one_minus_t2)
+        if expo > _DREZNER_EXP_CUTOFF:
+            acc += float(wi) * exp(expo) / sqrt(one_minus_t2)
+    integral = (half * acc) / (2.0 * pi)
+    return _clip01(base + integral)
+
+
+def _norm_bivariate_cdf_drezner(h: float, k: float, rho: float) -> float:
+    """
+    Drezner (1978) routing:
+    - Evaluate quadrature directly only on h <= 0, k <= 0, rho <= 0.
+    - Use symmetry/decomposition elsewhere for numerical stability.
+    """
+    if rho >= 1.0 - _DREZNER_RHO_EPS:
+        return _clip01(norm_cdf(min(h, k)))
+    if rho <= -1.0 + _DREZNER_RHO_EPS:
+        return _clip01(max(0.0, norm_cdf(h) - norm_cdf(-k)))
+    rho = max(-1.0 + _DREZNER_RHO_EPS, min(1.0 - _DREZNER_RHO_EPS, rho))
+
+    if abs(rho) < 1e-15:
+        return _clip01(norm_cdf(h) * norm_cdf(k))
+
+    if h * k * rho <= 0.0:
+        if h <= 0.0 and k <= 0.0 and rho <= 0.0:
+            return _norm_bivariate_cdf_drezner_core(h, k, rho)
+        if h <= 0.0 and k >= 0.0 and rho >= 0.0:
+            return _clip01(norm_cdf(h) - _norm_bivariate_cdf_drezner(h, -k, -rho))
+        if h >= 0.0 and k <= 0.0 and rho >= 0.0:
+            return _clip01(norm_cdf(k) - _norm_bivariate_cdf_drezner(-h, k, -rho))
+        if h >= 0.0 and k >= 0.0 and rho <= 0.0:
+            return _clip01(norm_cdf(h) + norm_cdf(k) - 1.0 + _norm_bivariate_cdf_drezner(-h, -k, rho))
+
+    rho_hk = _rho_reduced(h, k, rho)
+    rho_kh = _rho_reduced(k, h, rho)
+    val = (
+        _norm_bivariate_cdf_drezner(h, 0.0, rho_hk)
+        + _norm_bivariate_cdf_drezner(k, 0.0, rho_kh)
+        - _delta_hk(h, k)
+    )
+    return _clip01(val)
 
 
 def norm_bivariate_cdf(a: float, b: float, rho: float) -> float:
@@ -40,10 +164,7 @@ def norm_bivariate_cdf(a: float, b: float, rho: float) -> float:
         return float(multivariate_normal.cdf([a, b], mean=[0, 0], cov=[[1, rho], [rho, 1]]))
     except Exception:
         pass
-    # Fallback: conditional expectation approximation for |rho| < 1
-    if abs(rho) >= 1 - 1e-10:
-        return norm_cdf(min(a, b)) if rho > 0 else max(0.0, norm_cdf(a) + norm_cdf(b) - 1.0)
-    return norm_cdf(a) * norm_cdf(b) + (1 / (2 * 3.141592653589793)) * exp(-0.5 * (a**2 + b**2)) * rho
+    return _norm_bivariate_cdf_drezner(a, b, rho)
 
 
 # -----------------------------------------------------------------------------
@@ -87,12 +208,12 @@ def _alpha_beta(r: float, delta: float, sigma: float) -> tuple[float, float]:
     """
     α = σ²/(2b), β = 2b/σ² - 1 with cost-of-carry b = r - δ.
 
-    For |b| very small we fall back to a heuristic (α = 0.5 σ², β = -1),
-    which is not the exact analytical limit but avoids numerical blow-up.
+    This helper is only valid away from b=0. The b≈0 limit must be handled
+    by dedicated function-level branches on the full pricing expression.
     """
     b = r - delta
-    if abs(b) < 1e-12:
-        return 0.5 * sigma**2, -1.0
+    if abs(b) < _B_ZERO_EPS:
+        raise ValueError("alpha/beta undefined near b=0; use dedicated b≈0 limit branch")
     alpha = sigma**2 / (2 * b)
     beta = (2 * b / sigma**2) - 1
     return alpha, beta
@@ -129,7 +250,7 @@ def _B_plus_image(x: float, xi: float, tau: float, r: float, delta: float, sigma
     """*B^+_ξ = (ξ/x)^β e^{-rτ} * N(bar{d}'_ξ)."""
     if x <= 0 or xi <= 0:
         return 0.0
-    return (xi / x) ** beta * exp(-r * tau) * norm_cdf(_bar_d_prime_xi(x, xi, tau, r, delta, sigma))
+    return exp(beta * log(xi / x)) * exp(-r * tau) * norm_cdf(_bar_d_prime_xi(x, xi, tau, r, delta, sigma))
 
 
 def _D_minus(x: float, xi: float, tau: float, r: float, delta: float, sigma: float, alpha: float, beta: float) -> float:
@@ -146,12 +267,50 @@ def _B_minus_image(x: float, xi: float, tau: float, r: float, delta: float, sigm
     """*B^-_ξ = (ξ/x)^β e^{-rτ} * N(-bar{d}'_ξ) for maximum (reflected bond binary)."""
     if x <= 0 or xi <= 0:
         return 0.0
-    return (xi / x) ** beta * exp(-r * tau) * norm_cdf(-_bar_d_prime_xi(x, xi, tau, r, delta, sigma))
+    return exp(beta * log(xi / x)) * exp(-r * tau) * norm_cdf(-_bar_d_prime_xi(x, xi, tau, r, delta, sigma))
 
 
 def _D_plus(x: float, xi: float, tau: float, r: float, delta: float, sigma: float, alpha: float, beta: float) -> float:
     """D^+_ξ = α [ A^+_ξ - ξ * *B^-_ξ ]."""
     return alpha * (_A_plus(x, xi, tau, r, delta, sigma) - xi * _B_minus_image(x, xi, tau, r, delta, sigma, beta))
+
+
+def _partial_price_lookback_call_core(
+    x: float,
+    y_use: float,
+    tau: float,
+    r: float,
+    sigma: float,
+    lambda_mult: float,
+) -> float:
+    """Core BK call formula for b != 0."""
+    alpha, beta = _alpha_beta(r, 0.0, sigma)
+    K_call = lambda_mult * y_use
+    C = _european_call(x, K_call, tau, r, sigma, 0.0)
+    xi_fractional = y_use / lambda_mult
+    if xi_fractional <= 0:
+        return C
+    D = _D_minus(x, xi_fractional, tau, r, 0.0, sigma, alpha, beta)
+    return C + exp((beta + 2) * log(lambda_mult)) * D
+
+
+def _partial_price_lookback_put_core(
+    x: float,
+    z_use: float,
+    tau: float,
+    r: float,
+    sigma: float,
+    mu_mult: float,
+) -> float:
+    """Core BK put formula for b != 0."""
+    alpha, beta = _alpha_beta(r, 0.0, sigma)
+    K_put = mu_mult * z_use
+    P = _european_put(x, K_put, tau, r, sigma, 0.0)
+    xi_fractional = z_use / mu_mult
+    if xi_fractional <= 0:
+        return P
+    D = _D_plus(x, xi_fractional, tau, r, 0.0, sigma, alpha, beta)
+    return P + exp((beta + 2) * log(mu_mult)) * D
 
 
 # -----------------------------------------------------------------------------
@@ -189,14 +348,15 @@ def partial_price_lookback_call(
     y_use = S0 if y is None else y
     tau = T
     x = S0
-    alpha, beta = _alpha_beta(r, delta, sigma)
-    K_call = lambda_mult * y_use
-    C = _european_call(x, K_call, tau, r, sigma, delta)
-    xi_fractional = y_use / lambda_mult
-    if xi_fractional <= 0:
-        return C
-    D = _D_minus(x, xi_fractional, tau, r, delta, sigma, alpha, beta)
-    return C + (lambda_mult ** (beta + 2)) * D
+    b = r - delta
+    if abs(b) < _B_ZERO_EPS:
+        # Evaluate the full finite b->0 limit numerically via symmetric perturbation.
+        r_plus = delta + _B_ZERO_EPS
+        r_minus = delta - _B_ZERO_EPS
+        v_plus = _partial_price_lookback_call_core(x, y_use, tau, r_plus, sigma, lambda_mult)
+        v_minus = _partial_price_lookback_call_core(x, y_use, tau, r_minus, sigma, lambda_mult)
+        return 0.5 * (v_plus + v_minus)
+    return _partial_price_lookback_call_core(x, y_use, tau, r, sigma, lambda_mult)
 
 
 # -----------------------------------------------------------------------------
@@ -235,14 +395,15 @@ def partial_price_lookback_put(
     z_use = S0 if z is None else z
     tau = T
     x = S0
-    alpha, beta = _alpha_beta(r, delta, sigma)
-    K_put = mu_mult * z_use
-    P = _european_put(x, K_put, tau, r, sigma, delta)
-    xi_fractional = z_use / mu_mult
-    if xi_fractional <= 0:
-        return P
-    D = _D_plus(x, xi_fractional, tau, r, delta, sigma, alpha, beta)
-    return P + (mu_mult ** (beta + 2)) * D
+    b = r - delta
+    if abs(b) < _B_ZERO_EPS:
+        # Evaluate the full finite b->0 limit numerically via symmetric perturbation.
+        r_plus = delta + _B_ZERO_EPS
+        r_minus = delta - _B_ZERO_EPS
+        v_plus = _partial_price_lookback_put_core(x, z_use, tau, r_plus, sigma, mu_mult)
+        v_minus = _partial_price_lookback_put_core(x, z_use, tau, r_minus, sigma, mu_mult)
+        return 0.5 * (v_plus + v_minus)
+    return _partial_price_lookback_put_core(x, z_use, tau, r, sigma, mu_mult)
 
 
 # -----------------------------------------------------------------------------
@@ -296,12 +457,12 @@ def _B_bivariate(x: float, xi1: float, xi2: float, tau1: float, tau2: float, r: 
 
 def _B_image_bivariate(x: float, xi: float, tau1: float, tau2: float, r: float, sigma: float, beta: float, s1: int, s2: int) -> float:
     """Image of bond binary for second-order D; barrier ξ, same for both horizons. N_2 with reflected d'."""
-    bar_d1 = _bar_d_prime_xi(x, xi, tau1, r, sigma)
-    bar_d2 = _bar_d_prime_xi(x, xi, tau2, r, sigma)
+    bar_d1 = _bar_d_prime_xi(x, xi, tau1, r, 0.0, sigma)
+    bar_d2 = _bar_d_prime_xi(x, xi, tau2, r, 0.0, sigma)
     rho = _rho_partial_time(tau1, tau2)
     rho_signed = s1 * s2 * rho
     # B_image = (ξ/x)^β e^{-r τ_2} N_2(bar{d}'1, bar{d}'2; ρ) for appropriate signs
-    factor = (xi / x) ** beta * exp(-r * tau2) if xi > 0 and x > 0 else 0.0
+    factor = exp(beta * log(xi / x)) * exp(-r * tau2) if xi > 0 and x > 0 else 0.0
     return factor * norm_bivariate_cdf(s1 * bar_d1, s2 * bar_d2, rho_signed)
 
 
@@ -346,8 +507,46 @@ def _k_prime_tau_gap(tau: float, r: float, sigma: float, alpha: float) -> float:
 
 def _A_first_order(x: float, xi: float, tau: float, r: float, sigma: float, sign: int) -> float:
     """A^-_ξ = x*N(-d_ξ), A^+_ξ = x*N(d_ξ). sign: -1 for A^-, +1 for A^+."""
-    d = _d_xi(x, xi, tau, r, sigma)
+    d = _d_xi(x, xi, tau, r, 0.0, sigma)
     return x * norm_cdf(sign * d)
+
+
+def _partial_time_lookback_call_core(
+    x: float,
+    y_use: float,
+    tau1: float,
+    tau2: float,
+    tau_gap: float,
+    r: float,
+    sigma: float,
+) -> float:
+    """Core BK call formula for r != 0."""
+    alpha = sigma**2 / (2 * r)
+    beta = (2 * r / sigma**2) - 1
+    Q_pp = _Q_bivariate(x, y_use, y_use, tau1, tau2, r, sigma, 1, 1)
+    D_mm = _D_bivariate(x, y_use, tau1, tau2, r, sigma, alpha, beta, -1)
+    k_val = _k_tau_gap(tau_gap, r, sigma, alpha)
+    A_minus_y = _A_first_order(x, y_use, tau1, r, sigma, -1)
+    return Q_pp + D_mm + k_val * A_minus_y
+
+
+def _partial_time_lookback_put_core(
+    x: float,
+    z_use: float,
+    tau1: float,
+    tau2: float,
+    tau_gap: float,
+    r: float,
+    sigma: float,
+) -> float:
+    """Core BK put formula for r != 0."""
+    alpha = sigma**2 / (2 * r)
+    beta = (2 * r / sigma**2) - 1
+    Q_mm = _Q_bivariate(x, z_use, z_use, tau1, tau2, r, sigma, -1, -1)
+    D_pp = _D_bivariate(x, z_use, tau1, tau2, r, sigma, alpha, beta, 1)
+    kp_val = _k_prime_tau_gap(tau_gap, r, sigma, alpha)
+    A_plus_z = _A_first_order(x, z_use, tau1, r, sigma, 1)
+    return -Q_mm + D_pp + kp_val * A_plus_z
 
 
 # -----------------------------------------------------------------------------
@@ -384,18 +583,12 @@ def partial_time_lookback_call(
     tau_gap = T2 - T1
     x = S0
     y_use = S0 if y is None else y
-    if abs(r) < 1e-12:
-        alpha = 0.5 * sigma**2
-        beta = -1.0
-    else:
-        alpha = sigma**2 / (2 * r)
-        beta = (2 * r / sigma**2) - 1
-    # Q^{++}_{yy}, D^{--}_{yy}, k(τ)*A^-_y(x,τ_1)
-    Q_pp = _Q_bivariate(x, y_use, y_use, tau1, tau2, r, sigma, 1, 1)
-    D_mm = _D_bivariate(x, y_use, tau1, tau2, r, sigma, alpha, beta, -1)
-    k_val = _k_tau_gap(tau_gap, r, sigma, alpha)
-    A_minus_y = _A_first_order(x, y_use, tau1, r, sigma, -1)
-    return Q_pp + D_mm + k_val * A_minus_y
+    if abs(r) < _B_ZERO_EPS:
+        # Avoid heuristic alpha/beta injection by taking a symmetric limit on the full price.
+        v_plus = _partial_time_lookback_call_core(x, y_use, tau1, tau2, tau_gap, _B_ZERO_EPS, sigma)
+        v_minus = _partial_time_lookback_call_core(x, y_use, tau1, tau2, tau_gap, -_B_ZERO_EPS, sigma)
+        return 0.5 * (v_plus + v_minus)
+    return _partial_time_lookback_call_core(x, y_use, tau1, tau2, tau_gap, r, sigma)
 
 
 def partial_time_lookback_put(
@@ -429,19 +622,84 @@ def partial_time_lookback_put(
     tau_gap = T2 - T1
     x = S0
     z_use = S0 if z is None else z
-    if abs(r) < 1e-12:
-        alpha = 0.5 * sigma**2
-        beta = -1.0
-    else:
-        alpha = sigma**2 / (2 * r)
-        beta = (2 * r / sigma**2) - 1
-    # Vp = -Q^{--}_{zz} + D^{++}_{zz} + k'(τ)*A^+_z(x,τ_1)  (corrected for BK2005 typos)
-    Q_mm = _Q_bivariate(x, z_use, z_use, tau1, tau2, r, sigma, -1, -1)
-    D_pp = _D_bivariate(x, z_use, tau1, tau2, r, sigma, alpha, beta, 1)
-    kp_val = _k_prime_tau_gap(tau_gap, r, sigma, alpha)
-    A_plus_z = _A_first_order(x, z_use, tau1, r, sigma, 1)
-    raw = -Q_mm + D_pp + kp_val * A_plus_z
-    return raw
+    if abs(r) < _B_ZERO_EPS:
+        # Avoid heuristic alpha/beta injection by taking a symmetric limit on the full price.
+        v_plus = _partial_time_lookback_put_core(x, z_use, tau1, tau2, tau_gap, _B_ZERO_EPS, sigma)
+        v_minus = _partial_time_lookback_put_core(x, z_use, tau1, tau2, tau_gap, -_B_ZERO_EPS, sigma)
+        return 0.5 * (v_plus + v_minus)
+    return _partial_time_lookback_put_core(x, z_use, tau1, tau2, tau_gap, r, sigma)
+
+
+def partial_price_lookback_call_greeks(
+    S0: float,
+    T: float,
+    r: float,
+    sigma: float,
+    lambda_mult: float,
+    delta: float = 0.0,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for partial_price_lookback_call."""
+    pricer = lambda spot, vol: partial_price_lookback_call(
+        spot, T, r, vol, lambda_mult, delta=delta
+    )
+    return _finite_difference_greeks(pricer, S0, sigma, dS=dS, dSigma=dSigma)
+
+
+def partial_price_lookback_put_greeks(
+    S0: float,
+    T: float,
+    r: float,
+    sigma: float,
+    mu_mult: float,
+    delta: float = 0.0,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for partial_price_lookback_put."""
+    pricer = lambda spot, vol: partial_price_lookback_put(
+        spot, T, r, vol, mu_mult, delta=delta
+    )
+    return _finite_difference_greeks(pricer, S0, sigma, dS=dS, dSigma=dSigma)
+
+
+def partial_time_lookback_call_greeks(
+    S0: float,
+    T1: float,
+    T2: float,
+    r: float,
+    sigma: float,
+    t: float = 0.0,
+    y: Optional[float] = None,
+    delta: float = 0.0,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for partial_time_lookback_call."""
+    pricer = lambda spot, vol: partial_time_lookback_call(
+        spot, T1, T2, r, vol, t=t, y=y, delta=delta
+    )
+    return _finite_difference_greeks(pricer, S0, sigma, dS=dS, dSigma=dSigma)
+
+
+def partial_time_lookback_put_greeks(
+    S0: float,
+    T1: float,
+    T2: float,
+    r: float,
+    sigma: float,
+    t: float = 0.0,
+    z: Optional[float] = None,
+    delta: float = 0.0,
+    dS: Optional[float] = None,
+    dSigma: Optional[float] = None,
+) -> OptionGreeks:
+    """Finite-difference Delta/Gamma/Vega for partial_time_lookback_put."""
+    pricer = lambda spot, vol: partial_time_lookback_put(
+        spot, T1, T2, r, vol, t=t, z=z, delta=delta
+    )
+    return _finite_difference_greeks(pricer, S0, sigma, dS=dS, dSigma=dSigma)
 
 
 def partial_time_lookback_call_after_monitoring(
@@ -493,6 +751,7 @@ def _simulate_paths(
     S = np.full(n_paths, S0)
     S_min = np.full(n_paths, S0)
     S_max = np.full(n_paths, S0)
+    # Discrete monitoring of extrema; closed-form lookback formulas assume continuous monitoring.
     for i in range(n_steps):
         log_S += drift * dt + sigma * sqrt(dt) * Z[i]
         S = S0 * np.exp(log_S)
@@ -567,6 +826,7 @@ def partial_time_lookback_call_mc(
     log_S = np.zeros(n_paths)
     S = np.full(n_paths, S0)
     Y_T1 = np.full(n_paths, S0)
+    # Discrete monitoring over [0, T1]; this differs from continuous-monitoring closed-form assumptions.
     for i in range(n_steps):
         t = (i + 1) * dt
         log_S += drift * dt + sigma * sqrt(dt) * rng.standard_normal(n_paths)
@@ -600,6 +860,7 @@ def partial_time_lookback_put_mc(
     log_S = np.zeros(n_paths)
     S = np.full(n_paths, S0)
     Z_T1 = np.full(n_paths, S0)
+    # Discrete monitoring over [0, T1]; this differs from continuous-monitoring closed-form assumptions.
     for i in range(n_steps):
         t = (i + 1) * dt
         log_S += drift * dt + sigma * sqrt(dt) * rng.standard_normal(n_paths)

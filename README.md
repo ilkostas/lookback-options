@@ -1,6 +1,6 @@
 # Lookback Options
 
-Quantitative finance library for pricing multiple families of European lookback options under Black-Scholes dynamics, with a mix of closed-form valuation, Monte Carlo engines, finite-difference Greeks, and discrete-monitoring adjustments where the literature supports them.
+Quantitative finance codebase for pricing multiple families of European lookback options under Black-Scholes dynamics, with a mix of closed-form valuation, Monte Carlo engines, finite-difference Greeks, and discrete-monitoring adjustments where the literature supports them.
 
 This repository is designed to demonstrate breadth across path-dependent exotics and depth in numerical implementation: reflected-path pricing formulas, method-of-images constructions, custom bivariate normal integration, quanto drift adjustment, validation harnesses, and explicit edge-case handling for difficult parameter regimes.
 

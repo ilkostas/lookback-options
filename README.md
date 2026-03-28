@@ -33,7 +33,8 @@ Notation:
 - \(T_1 < T_2\) defines the partial-time monitoring window
 - \(F_c\) is the contractual quanto conversion factor
 
-## Why This Repository Stands Out
+## What is Different about this Repository
+
 
 Lookback options are not a single formula copied across variants. Each family changes the role of the path extremum, the strike convention, the monitoring window, or the currency layer, which in turn changes the mathematics and the numerical treatment. This repository reflects that reality directly.
 
@@ -170,37 +171,6 @@ python "Reverse-Strike Lookback/reverse_strike_lookback.py"
 python "Limited-Risk Lookback/limited_risk_lookback.py"
 python "Partial Lookback/partial_lookback.py"
 python "Quanto Lookback/quanto_lookback.py"
-```
-
-### Use As A Library
-
-The codebase is organized as standalone modules rather than an installed package. One simple pattern is dynamic import by path:
-
-```python
-from importlib.util import module_from_spec, spec_from_file_location
-
-spec = spec_from_file_location(
-    "floating",
-    "Floating-Strike Lookback/floating_strike_lookback.py",
-)
-floating = module_from_spec(spec)
-spec.loader.exec_module(floating)
-
-price = floating.floating_strike_lookback_call(
-    S0=100.0,
-    T=1.0,
-    r=0.05,
-    sigma=0.20,
-    delta=0.01,
-)
-greeks = floating.floating_strike_lookback_call_greeks(
-    S0=100.0,
-    T=1.0,
-    r=0.05,
-    sigma=0.20,
-    delta=0.01,
-)
-print(price, greeks)
 ```
 
 ## Assumptions And Scope

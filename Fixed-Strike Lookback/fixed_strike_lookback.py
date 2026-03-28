@@ -87,11 +87,23 @@ def d1(S: float, K: float, T: float, r: float, delta: float, sigma: float) -> fl
 
 
 def d2(S: float, K: float, T: float, r: float, delta: float, sigma: float) -> float:
-    return d1(S, K, T, r, delta, sigma) - sigma * sqrt(T)
+    sqrt_T = sqrt(T)
+    return (log(S / K) + (r - delta - 0.5 * sigma**2) * T) / (sigma * sqrt_T)
 
 
 def d3(S: float, K: float, T: float, r: float, delta: float, sigma: float) -> float:
-    return d1(S, K, T, r, delta, sigma) - 2 * (r - delta) * sqrt(T) / sigma
+    sqrt_T = sqrt(T)
+    return (log(S / K) + (-r + delta + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+
+
+def _d123(S: float, K: float, T: float, r: float, delta: float, sigma: float) -> tuple[float, float, float]:
+    sqrt_T = sqrt(T)
+    log_ratio = log(S / K)
+    sigma_sq = sigma**2
+    d1_val = (log_ratio + (r - delta + 0.5 * sigma_sq) * T) / (sigma * sqrt_T)
+    d2_val = d1_val - sigma * sqrt_T
+    d3_val = d1_val - 2 * (r - delta) * sqrt_T / sigma
+    return d1_val, d2_val, d3_val
 
 
 # -----------------------------------------------------------------------------
@@ -122,20 +134,20 @@ def fixed_strike_lookback_call(
     if T <= 0:
         return max((L if L is not None else S0) - K, 0.0)
     b = r - delta
-    _d1 = d1(S0, K, T, r, delta, sigma)
-    _d2 = d2(S0, K, T, r, delta, sigma)
-    _d3 = d3(S0, K, T, r, delta, sigma)
-    term1 = S0 * exp(-delta * T) * norm_cdf(_d1)
-    term2 = K * exp(-r * T) * norm_cdf(_d2)
+    _d1, _d2, _d3 = _d123(S0, K, T, r, delta, sigma)
+    disc_div = exp(-delta * T)
+    disc_rf = exp(-r * T)
+    term1 = S0 * disc_div * norm_cdf(_d1)
+    term2 = K * disc_rf * norm_cdf(_d2)
     expo = -2 * b / (sigma**2)
     log_ratio = log(S0 / K)
     if abs(b) < 1e-12:
-        term3 = 0.5 * (sigma**2) * T * S0 * (norm_cdf(-_d3) - exp(-r * T) * norm_cdf(-_d2))
+        term3 = 0.5 * (sigma**2) * T * S0 * (norm_cdf(-_d3) - disc_rf * norm_cdf(-_d2))
     else:
         # b ≠ 0: use the standard closed-form term that smoothly
         # connects to the b → 0 limit above.
         term3 = S0 * (sigma**2 / (2 * b)) * (
-            exp(-delta * T) * norm_cdf(_d1) - exp(expo * log_ratio) * exp(-r * T) * norm_cdf(_d3)
+            disc_div * norm_cdf(_d1) - exp(expo * log_ratio) * disc_rf * norm_cdf(_d3)
         )
     return term1 - term2 + term3
 
@@ -168,20 +180,20 @@ def fixed_strike_lookback_put(
     if T <= 0:
         return max(K - min(S0, L if L is not None else S0), 0.0)
     b = r - delta
-    _d1 = d1(S0, K, T, r, delta, sigma)
-    _d2 = d2(S0, K, T, r, delta, sigma)
-    _d3 = d3(S0, K, T, r, delta, sigma)
-    term1 = K * exp(-r * T) * norm_cdf(-_d2)
-    term2 = S0 * exp(-delta * T) * norm_cdf(-_d1)
+    _d1, _d2, _d3 = _d123(S0, K, T, r, delta, sigma)
+    disc_div = exp(-delta * T)
+    disc_rf = exp(-r * T)
+    term1 = K * disc_rf * norm_cdf(-_d2)
+    term2 = S0 * disc_div * norm_cdf(-_d1)
     expo = -2 * b / (sigma**2)
     log_ratio = log(S0 / K)
     if abs(b) < 1e-12:
-        term3 = 0.5 * (sigma**2) * T * S0 * (-norm_cdf(_d3) + exp(-r * T) * norm_cdf(_d2))
+        term3 = 0.5 * (sigma**2) * T * S0 * (-norm_cdf(_d3) + disc_rf * norm_cdf(_d2))
     else:
         # b ≠ 0: use the standard closed-form term that smoothly
         # connects to the b → 0 limit above.
         term3 = S0 * (sigma**2 / (2 * b)) * (
-            exp(expo * log_ratio) * exp(-r * T) * norm_cdf(-_d3) - exp(-delta * T) * norm_cdf(-_d1)
+            exp(expo * log_ratio) * disc_rf * norm_cdf(-_d3) - disc_div * norm_cdf(-_d1)
         )
     return term1 - term2 + term3
 

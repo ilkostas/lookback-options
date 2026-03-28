@@ -31,11 +31,7 @@ class OptionGreeks:
 
 def norm_cdf(x: float) -> float:
     """Cumulative distribution function of the standard normal N(d)."""
-    try:
-        from scipy.stats import norm
-        return float(norm.cdf(x))
-    except ImportError:
-        return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+    return 0.5 * (1.0 + erf(x / sqrt(2.0)))
 
 
 def norm_pdf(x: float) -> float:
@@ -86,22 +82,27 @@ def _d1(S: float, K: float, T: float, r: float, delta: float, sigma: float) -> f
 
 
 def _d2(S: float, K: float, T: float, r: float, delta: float, sigma: float) -> float:
-    return _d1(S, K, T, r, delta, sigma) - sigma * sqrt(T)
+    sqrt_T = sqrt(T)
+    return (log(S / K) + (r - delta - 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+
+
+def _d12(S: float, K: float, T: float, r: float, delta: float, sigma: float) -> tuple[float, float]:
+    sqrt_T = sqrt(T)
+    d1_val = (log(S / K) + (r - delta + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+    return d1_val, d1_val - sigma * sqrt_T
 
 
 def _european_call(S0: float, K: float, T: float, r: float, sigma: float, delta: float = 0.0) -> float:
     if T <= 0:
         return max(S0 - K, 0.0)
-    d1_val = _d1(S0, K, T, r, delta, sigma)
-    d2_val = _d2(S0, K, T, r, delta, sigma)
+    d1_val, d2_val = _d12(S0, K, T, r, delta, sigma)
     return S0 * exp(-delta * T) * norm_cdf(d1_val) - K * exp(-r * T) * norm_cdf(d2_val)
 
 
 def _european_put(S0: float, K: float, T: float, r: float, sigma: float, delta: float = 0.0) -> float:
     if T <= 0:
         return max(K - S0, 0.0)
-    d1_val = _d1(S0, K, T, r, delta, sigma)
-    d2_val = _d2(S0, K, T, r, delta, sigma)
+    d1_val, d2_val = _d12(S0, K, T, r, delta, sigma)
     return K * exp(-r * T) * norm_cdf(-d2_val) - S0 * exp(-delta * T) * norm_cdf(-d1_val)
 
 

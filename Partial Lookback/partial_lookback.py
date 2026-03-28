@@ -45,6 +45,15 @@ class OptionGreeks:
     vega: float
 
 
+@dataclass(frozen=True)
+class _PartialBivariateTerms:
+    d1: float
+    d1p: float
+    d2: float
+    d2p: float
+    rho_signed: float
+
+
 def _finite_difference_greeks(
     pricer: Callable[[float, float], float],
     S0: float,
@@ -439,20 +448,32 @@ def _d1_d2_partial(x: float, xi1: float, xi2: float, tau1: float, tau2: float, r
     return d1_val, d1p, d2_val, d2p
 
 
+def _partial_bivariate_terms(
+    x: float,
+    xi1: float,
+    xi2: float,
+    tau1: float,
+    tau2: float,
+    r: float,
+    sigma: float,
+    s1: int,
+    s2: int,
+) -> _PartialBivariateTerms:
+    d1_val, d1p, d2_val, d2p = _d1_d2_partial(x, xi1, xi2, tau1, tau2, r, sigma)
+    rho_signed = s1 * s2 * _rho_partial_time(tau1, tau2)
+    return _PartialBivariateTerms(d1_val, d1p, d2_val, d2p, rho_signed)
+
+
 def _A_bivariate(x: float, xi1: float, xi2: float, tau1: float, tau2: float, r: float, sigma: float, s1: int, s2: int) -> float:
     """A^{s1 s2}_{ξ1 ξ2} = x * N_2(s1*d1, s2*d2; s1*s2*ρ)."""
-    d1_val, _, d2_val, _ = _d1_d2_partial(x, xi1, xi2, tau1, tau2, r, sigma)
-    rho = _rho_partial_time(tau1, tau2)
-    rho_signed = s1 * s2 * rho
-    return x * norm_bivariate_cdf(s1 * d1_val, s2 * d2_val, rho_signed)
+    terms = _partial_bivariate_terms(x, xi1, xi2, tau1, tau2, r, sigma, s1, s2)
+    return x * norm_bivariate_cdf(s1 * terms.d1, s2 * terms.d2, terms.rho_signed)
 
 
 def _B_bivariate(x: float, xi1: float, xi2: float, tau1: float, tau2: float, r: float, sigma: float, s1: int, s2: int) -> float:
     """B^{s1 s2}_{ξ1 ξ2} = e^{-r τ_2} N_2(s1*d'1, s2*d'2; s1*s2*ρ)."""
-    _, d1p, _, d2p = _d1_d2_partial(x, xi1, xi2, tau1, tau2, r, sigma)
-    rho = _rho_partial_time(tau1, tau2)
-    rho_signed = s1 * s2 * rho
-    return exp(-r * tau2) * norm_bivariate_cdf(s1 * d1p, s2 * d2p, rho_signed)
+    terms = _partial_bivariate_terms(x, xi1, xi2, tau1, tau2, r, sigma, s1, s2)
+    return exp(-r * tau2) * norm_bivariate_cdf(s1 * terms.d1p, s2 * terms.d2p, terms.rho_signed)
 
 
 def _B_image_bivariate(x: float, xi: float, tau1: float, tau2: float, r: float, sigma: float, beta: float, s1: int, s2: int) -> float:
@@ -468,8 +489,9 @@ def _B_image_bivariate(x: float, xi: float, tau1: float, tau2: float, r: float, 
 
 def _Q_bivariate(x: float, xi1: float, xi2: float, tau1: float, tau2: float, r: float, sigma: float, s1: int, s2: int) -> float:
     """Q^{s1 s2}_{ξ1 ξ2} = A^{s1 s2}_{ξ1 ξ2} - ξ2 * B^{s1 s2}_{ξ1 ξ2}."""
-    A = _A_bivariate(x, xi1, xi2, tau1, tau2, r, sigma, s1, s2)
-    B = _B_bivariate(x, xi1, xi2, tau1, tau2, r, sigma, s1, s2)
+    terms = _partial_bivariate_terms(x, xi1, xi2, tau1, tau2, r, sigma, s1, s2)
+    A = x * norm_bivariate_cdf(s1 * terms.d1, s2 * terms.d2, terms.rho_signed)
+    B = exp(-r * tau2) * norm_bivariate_cdf(s1 * terms.d1p, s2 * terms.d2p, terms.rho_signed)
     return A - xi2 * B
 
 
@@ -760,6 +782,36 @@ def _simulate_paths(
     return S, S_min, S_max
 
 
+def _simulate_partial_time_paths(
+    S0: float,
+    T1: float,
+    T2: float,
+    r: float,
+    sigma: float,
+    delta: float,
+    n_paths: int,
+    n_steps: int,
+    track: str,
+    rng: Optional[np.random.Generator] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if rng is None:
+        rng = np.random.default_rng()
+    dt = T2 / n_steps
+    drift = r - delta - 0.5 * sigma**2
+    log_S = np.zeros(n_paths)
+    S = np.full(n_paths, S0)
+    extremum = np.full(n_paths, S0)
+    update_extremum = np.minimum if track == "min" else np.maximum
+    # Discrete monitoring over [0, T1]; this differs from continuous-monitoring closed-form assumptions.
+    for i in range(n_steps):
+        t = (i + 1) * dt
+        log_S += drift * dt + sigma * sqrt(dt) * rng.standard_normal(n_paths)
+        S = S0 * np.exp(log_S)
+        if t <= T1:
+            extremum = update_extremum(extremum, S)
+    return S, extremum
+
+
 def partial_price_lookback_call_mc(
     S0: float,
     T: float,
@@ -818,21 +870,9 @@ def partial_time_lookback_call_mc(
         raise ValueError("Require 0 < T_1 < T_2")
     if sigma <= 0:
         raise ValueError("Volatility sigma must be positive")
-    if rng is None:
-        rng = np.random.default_rng()
-    dt = (T2 - 0) / n_steps
-    steps1 = max(1, int(T1 / dt))
-    drift = r - delta - 0.5 * sigma**2
-    log_S = np.zeros(n_paths)
-    S = np.full(n_paths, S0)
-    Y_T1 = np.full(n_paths, S0)
-    # Discrete monitoring over [0, T1]; this differs from continuous-monitoring closed-form assumptions.
-    for i in range(n_steps):
-        t = (i + 1) * dt
-        log_S += drift * dt + sigma * sqrt(dt) * rng.standard_normal(n_paths)
-        S = S0 * np.exp(log_S)
-        if t <= T1:
-            Y_T1 = np.minimum(Y_T1, S)
+    S, Y_T1 = _simulate_partial_time_paths(
+        S0, T1, T2, r, sigma, delta, n_paths, n_steps, "min", rng
+    )
     payoffs = np.maximum(S - Y_T1, 0.0)
     return exp(-r * T2) * float(np.mean(payoffs))
 
@@ -853,20 +893,9 @@ def partial_time_lookback_put_mc(
         raise ValueError("Require 0 < T_1 < T_2")
     if sigma <= 0:
         raise ValueError("Volatility sigma must be positive")
-    if rng is None:
-        rng = np.random.default_rng()
-    dt = (T2 - 0) / n_steps
-    drift = r - delta - 0.5 * sigma**2
-    log_S = np.zeros(n_paths)
-    S = np.full(n_paths, S0)
-    Z_T1 = np.full(n_paths, S0)
-    # Discrete monitoring over [0, T1]; this differs from continuous-monitoring closed-form assumptions.
-    for i in range(n_steps):
-        t = (i + 1) * dt
-        log_S += drift * dt + sigma * sqrt(dt) * rng.standard_normal(n_paths)
-        S = S0 * np.exp(log_S)
-        if t <= T1:
-            Z_T1 = np.maximum(Z_T1, S)
+    S, Z_T1 = _simulate_partial_time_paths(
+        S0, T1, T2, r, sigma, delta, n_paths, n_steps, "max", rng
+    )
     payoffs = np.maximum(Z_T1 - S, 0.0)
     return exp(-r * T2) * float(np.mean(payoffs))
 

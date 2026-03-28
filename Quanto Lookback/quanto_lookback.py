@@ -83,11 +83,23 @@ def _d1(S: float, K: float, T: float, r: float, delta: float, sigma: float) -> f
 
 
 def _d2(S: float, K: float, T: float, r: float, delta: float, sigma: float) -> float:
-    return _d1(S, K, T, r, delta, sigma) - sigma * sqrt(T)
+    sqrt_T = sqrt(T)
+    return (log(S / K) + (r - delta - 0.5 * sigma**2) * T) / (sigma * sqrt_T)
 
 
 def _d3(S: float, K: float, T: float, r: float, delta: float, sigma: float) -> float:
-    return _d1(S, K, T, r, delta, sigma) - 2 * (r - delta) * sqrt(T) / sigma
+    sqrt_T = sqrt(T)
+    return (log(S / K) + (-r + delta + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+
+
+def _d123(S: float, K: float, T: float, r: float, delta: float, sigma: float) -> tuple[float, float, float]:
+    sqrt_T = sqrt(T)
+    log_ratio = log(S / K)
+    sigma_sq = sigma**2
+    d1_val = (log_ratio + (r - delta + 0.5 * sigma_sq) * T) / (sigma * sqrt_T)
+    d2_val = d1_val - sigma * sqrt_T
+    d3_val = d1_val - 2 * (r - delta) * sqrt_T / sigma
+    return d1_val, d2_val, d3_val
 
 
 def _quanto_r_effective(r_foreign: float, sigma_asset: float, sigma_fx: float, rho: float) -> float:
@@ -98,6 +110,29 @@ def _quanto_r_effective(r_foreign: float, sigma_asset: float, sigma_fx: float, r
 def _validate_rho(rho: float) -> None:
     if not -1.0 <= rho <= 1.0:
         raise ValueError("Correlation rho must be in [-1, 1]")
+
+
+def _quanto_closed_form_value(
+    T: float,
+    r_domestic: float,
+    r_foreign: float,
+    sigma_asset: float,
+    sigma_fx: float,
+    rho: float,
+    quanto_factor: float,
+    expiry_value: float,
+    std_pricer: Callable[[float], float],
+) -> float:
+    if T < 0:
+        raise ValueError("Time to maturity T must be non-negative")
+    if sigma_asset <= 0 or sigma_fx <= 0:
+        raise ValueError("Volatility sigma_asset and sigma_fx must be positive")
+    _validate_rho(rho)
+    if T <= 0:
+        return expiry_value
+    r_eff = _quanto_r_effective(r_foreign, sigma_asset, sigma_fx, rho)
+    v_std = std_pricer(r_eff)
+    return quanto_factor * v_std * exp((r_eff - r_domestic) * T)
 
 
 # -----------------------------------------------------------------------------
@@ -111,18 +146,18 @@ def _fixed_strike_call_std(S0: float, K: float, T: float, r: float, delta: float
     if T <= 0:
         return max(S0 - K, 0.0)
     b = r - delta
-    d1_val = _d1(S0, K, T, r, delta, sigma)
-    d2_val = _d2(S0, K, T, r, delta, sigma)
-    d3_val = _d3(S0, K, T, r, delta, sigma)
-    term1 = S0 * exp(-delta * T) * norm_cdf(d1_val)
-    term2 = K * exp(-r * T) * norm_cdf(d2_val)
+    d1_val, d2_val, d3_val = _d123(S0, K, T, r, delta, sigma)
+    disc_div = exp(-delta * T)
+    disc_rf = exp(-r * T)
+    term1 = S0 * disc_div * norm_cdf(d1_val)
+    term2 = K * disc_rf * norm_cdf(d2_val)
     expo = -2 * b / (sigma**2)
     log_ratio = log(S0 / K)
     if abs(b) < 1e-12:
-        term3 = 0.5 * (sigma**2) * T * S0 * (norm_cdf(-d3_val) - exp(-r * T) * norm_cdf(-d2_val))
+        term3 = 0.5 * (sigma**2) * T * S0 * (norm_cdf(-d3_val) - disc_rf * norm_cdf(-d2_val))
     else:
         term3 = (sigma**2 / (2 * b)) * S0 * (
-            exp(expo * log_ratio) * norm_cdf(-d3_val) - exp(-r * T) * norm_cdf(-d2_val)
+            exp(expo * log_ratio) * norm_cdf(-d3_val) - disc_rf * norm_cdf(-d2_val)
         )
     return term1 - term2 + term3
 
@@ -143,16 +178,17 @@ def quanto_fixed_strike_lookback_call(
     Standard fixed-rate quanto lookback call. Payoff in domestic: F_c * max(S_max_T - K, 0).
     Pricing from inception only (no L). Closed form: V_std with r_eff, then F_c * V_std * exp((r_eff - r_d)*T).
     """
-    if T < 0:
-        raise ValueError("Time to maturity T must be non-negative")
-    if sigma_asset <= 0 or sigma_fx <= 0:
-        raise ValueError("Volatility sigma_asset and sigma_fx must be positive")
-    _validate_rho(rho)
-    if T <= 0:
-        return quanto_factor * max(S0 - K, 0.0)
-    r_eff = _quanto_r_effective(r_foreign, sigma_asset, sigma_fx, rho)
-    v_std = _fixed_strike_call_std(S0, K, T, r_eff, delta, sigma_asset)
-    return quanto_factor * v_std * exp((r_eff - r_domestic) * T)
+    return _quanto_closed_form_value(
+        T,
+        r_domestic,
+        r_foreign,
+        sigma_asset,
+        sigma_fx,
+        rho,
+        quanto_factor,
+        quanto_factor * max(S0 - K, 0.0),
+        lambda r_eff: _fixed_strike_call_std(S0, K, T, r_eff, delta, sigma_asset),
+    )
 
 
 def _fixed_strike_put_std(S0: float, K: float, T: float, r: float, delta: float, sigma: float) -> float:
@@ -160,17 +196,17 @@ def _fixed_strike_put_std(S0: float, K: float, T: float, r: float, delta: float,
     if T <= 0:
         return max(K - S0, 0.0)
     b = r - delta
-    d1_val = _d1(S0, K, T, r, delta, sigma)
-    d2_val = _d2(S0, K, T, r, delta, sigma)
-    d3_val = _d3(S0, K, T, r, delta, sigma)
-    term1 = K * exp(-r * T) * norm_cdf(-d2_val)
-    term2 = S0 * exp(-delta * T) * norm_cdf(-d1_val)
+    d1_val, d2_val, d3_val = _d123(S0, K, T, r, delta, sigma)
+    disc_div = exp(-delta * T)
+    disc_rf = exp(-r * T)
+    term1 = K * disc_rf * norm_cdf(-d2_val)
+    term2 = S0 * disc_div * norm_cdf(-d1_val)
     b_eff = b if abs(b) >= 1e-12 else (1e-12 if b >= 0 else -1e-12)
     expo = -2 * b_eff / (sigma**2)
     log_ratio = log(S0 / K)
     term3 = (sigma**2 / (2 * b_eff)) * (
-        -S0 * exp(-delta * T) * norm_cdf(-d1_val)
-        + K * exp(-r * T) * exp(expo * log_ratio) * norm_cdf(-d3_val)
+        -S0 * disc_div * norm_cdf(-d1_val)
+        + K * disc_rf * exp(expo * log_ratio) * norm_cdf(-d3_val)
     )
     return term1 - term2 + term3
 
@@ -191,16 +227,17 @@ def quanto_fixed_strike_lookback_put(
     Standard fixed-rate quanto lookback put. Payoff in domestic: F_c * max(K - S_min_T, 0).
     Pricing from inception only (no L). Closed form: V_std with r_eff, then F_c * V_std * exp((r_eff - r_d)*T).
     """
-    if T < 0:
-        raise ValueError("Time to maturity T must be non-negative")
-    if sigma_asset <= 0 or sigma_fx <= 0:
-        raise ValueError("Volatility sigma_asset and sigma_fx must be positive")
-    _validate_rho(rho)
-    if T <= 0:
-        return quanto_factor * max(K - S0, 0.0)
-    r_eff = _quanto_r_effective(r_foreign, sigma_asset, sigma_fx, rho)
-    v_std = _fixed_strike_put_std(S0, K, T, r_eff, delta, sigma_asset)
-    return quanto_factor * v_std * exp((r_eff - r_domestic) * T)
+    return _quanto_closed_form_value(
+        T,
+        r_domestic,
+        r_foreign,
+        sigma_asset,
+        sigma_fx,
+        rho,
+        quanto_factor,
+        quanto_factor * max(K - S0, 0.0),
+        lambda r_eff: _fixed_strike_put_std(S0, K, T, r_eff, delta, sigma_asset),
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -212,23 +249,21 @@ def _floating_strike_call_std(S0: float, T: float, r: float, delta: float, sigma
     """Standard floating-strike lookback call with L=S0, single r (for quanto scaling)."""
     if T <= 0:
         return 0.0
-    L_use = S0
     b = r - delta
-    d1_val = _d1(S0, L_use, T, r, delta, sigma)
-    d2_val = _d2(S0, L_use, T, r, delta, sigma)
-    d3_val = _d3(S0, L_use, T, r, delta, sigma)
-    term1 = S0 * exp(-delta * T) * norm_cdf(d1_val)
-    term2 = L_use * exp(-r * T) * norm_cdf(d2_val)
+    d1_val, d2_val, d3_val = _d123(S0, S0, T, r, delta, sigma)
+    disc_div = exp(-delta * T)
+    disc_rf = exp(-r * T)
+    term1 = S0 * disc_div * norm_cdf(d1_val)
+    term2 = S0 * disc_rf * norm_cdf(d2_val)
     expo = -2 * b / (sigma**2)
-    log_ratio = log(S0 / L_use)
     if abs(b) < 1e-12:
-        term3 = 0.5 * (sigma**2) * S0 * exp(-r * T) * (
+        term3 = 0.5 * (sigma**2) * S0 * disc_rf * (
             T * norm_cdf(-d1_val) + sqrt(T) / sigma * norm_pdf(d1_val)
         )
     else:
         term3 = (sigma**2 / (2 * b)) * S0 * (
-            exp(-delta * T) * norm_cdf(-d1_val)
-            - exp(-r * T) * exp(expo * log_ratio) * norm_cdf(-d3_val)
+            disc_div * norm_cdf(-d1_val)
+            - disc_rf * norm_cdf(-d3_val)
         )
     return term1 - term2 + term3
 
@@ -248,35 +283,34 @@ def quanto_floating_strike_lookback_call(
     Quanto floating-strike lookback call. Payoff in domestic: F_c * (S_T - Y_T).
     Pricing from inception only (no L). Closed form: V_std with r_eff, then F_c * V_std * exp((r_eff - r_d)*T).
     """
-    if T < 0:
-        raise ValueError("Time to maturity T must be non-negative")
-    if sigma_asset <= 0 or sigma_fx <= 0:
-        raise ValueError("Volatility sigma_asset and sigma_fx must be positive")
-    _validate_rho(rho)
-    if T <= 0:
-        return 0.0
-    r_eff = _quanto_r_effective(r_foreign, sigma_asset, sigma_fx, rho)
-    v_std = _floating_strike_call_std(S0, T, r_eff, delta, sigma_asset)
-    return quanto_factor * v_std * exp((r_eff - r_domestic) * T)
+    return _quanto_closed_form_value(
+        T,
+        r_domestic,
+        r_foreign,
+        sigma_asset,
+        sigma_fx,
+        rho,
+        quanto_factor,
+        0.0,
+        lambda r_eff: _floating_strike_call_std(S0, T, r_eff, delta, sigma_asset),
+    )
 
 
 def _floating_strike_put_std(S0: float, T: float, r: float, delta: float, sigma: float) -> float:
     """Standard floating-strike lookback put with L=S0, single r (for quanto scaling)."""
     if T <= 0:
         return 0.0
-    L_use = S0
     b = r - delta
-    d1_val = _d1(S0, L_use, T, r, delta, sigma)
-    d2_val = _d2(S0, L_use, T, r, delta, sigma)
-    d3_val = _d3(S0, L_use, T, r, delta, sigma)
-    term1 = -S0 * exp(-delta * T) * norm_cdf(-d1_val)
-    term2 = L_use * exp(-r * T) * norm_cdf(-d2_val)
+    d1_val, d2_val, d3_val = _d123(S0, S0, T, r, delta, sigma)
+    disc_div = exp(-delta * T)
+    disc_rf = exp(-r * T)
+    term1 = -S0 * disc_div * norm_cdf(-d1_val)
+    term2 = S0 * disc_rf * norm_cdf(-d2_val)
     b_eff = b if abs(b) >= 1e-12 else (1e-12 if b >= 0 else -1e-12)
     expo = -2 * b_eff / (sigma**2)
-    log_ratio = log(S0 / L_use)
     term3 = (sigma**2 / (2 * b_eff)) * S0 * (
-        -exp(-delta * T) * norm_cdf(d1_val)
-        + exp(-r * T) * exp(expo * log_ratio) * norm_cdf(d3_val)
+        -disc_div * norm_cdf(d1_val)
+        + disc_rf * norm_cdf(d3_val)
     )
     return term1 + term2 + term3
 
@@ -296,16 +330,17 @@ def quanto_floating_strike_lookback_put(
     Quanto floating-strike lookback put. Payoff in domestic: F_c * (Z_T - S_T).
     Pricing from inception only (no L). Closed form: V_std with r_eff, then F_c * V_std * exp((r_eff - r_d)*T).
     """
-    if T < 0:
-        raise ValueError("Time to maturity T must be non-negative")
-    if sigma_asset <= 0 or sigma_fx <= 0:
-        raise ValueError("Volatility sigma_asset and sigma_fx must be positive")
-    _validate_rho(rho)
-    if T <= 0:
-        return 0.0
-    r_eff = _quanto_r_effective(r_foreign, sigma_asset, sigma_fx, rho)
-    v_std = _floating_strike_put_std(S0, T, r_eff, delta, sigma_asset)
-    return quanto_factor * v_std * exp((r_eff - r_domestic) * T)
+    return _quanto_closed_form_value(
+        T,
+        r_domestic,
+        r_foreign,
+        sigma_asset,
+        sigma_fx,
+        rho,
+        quanto_factor,
+        0.0,
+        lambda r_eff: _floating_strike_put_std(S0, T, r_eff, delta, sigma_asset),
+    )
 
 
 def quanto_fixed_strike_lookback_call_greeks(

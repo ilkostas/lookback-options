@@ -22,6 +22,20 @@ class OptionGreeks:
     vega: float
 
 
+@dataclass(frozen=True)
+class _FloatingTerms:
+    L_use: float
+    b: float
+    expo: float
+    log_ratio: float
+    sqrt_T: float
+    d1: float
+    d2: float
+    d3: float
+    disc_div: float
+    disc_rf: float
+
+
 def norm_cdf(x: float) -> float:
     """Cumulative distribution function of the standard normal N(d)."""
     try:
@@ -92,6 +106,69 @@ def d3(S: float, K: float, T: float, r: float, delta: float, sigma: float) -> fl
     return d1(S, K, T, r, delta, sigma) - 2 * (r - delta) * sqrt(T) / sigma
 
 
+def _floating_terms(
+    S0: float,
+    T: float,
+    r: float,
+    sigma: float,
+    delta: float,
+    L: Optional[float],
+) -> _FloatingTerms:
+    L_use = S0 if L is None else L
+    b = r - delta
+    expo = 2.0 * b / (sigma**2)
+    log_ratio = log(L_use / S0)
+    sqrt_T = sqrt(T)
+    d1_val = (log(S0 / L_use) + (b + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+    d2_val = d1_val - sigma * sqrt_T
+    d3_val = d1_val - (2.0 * b / sigma) * sqrt_T
+    return _FloatingTerms(
+        L_use=L_use,
+        b=b,
+        expo=expo,
+        log_ratio=log_ratio,
+        sqrt_T=sqrt_T,
+        d1=d1_val,
+        d2=d2_val,
+        d3=d3_val,
+        disc_div=exp(-delta * T),
+        disc_rf=exp(-r * T),
+    )
+
+
+def _floating_strike_bgk(
+    pricer: Callable[..., float],
+    S0: float,
+    T: float,
+    r: float,
+    sigma: float,
+    monitoring_points: int,
+    delta: float,
+    L: Optional[float],
+    *,
+    is_call: bool,
+) -> float:
+    _validate_monitoring_points(monitoring_points)
+    if T <= 0:
+        return pricer(S0, T, r, sigma, delta=delta, L=L)
+    corr = _BGK_BETA1 * sigma * sqrt(T / monitoring_points)
+    eta = exp(corr)
+    if is_call:
+        if L is None:
+            v_cont = pricer(S0, T, r, sigma, delta=delta, L=None)
+            return (v_cont - S0) * (1.0 + corr) + S0
+        l_adjusted = L / eta
+        v_cont = pricer(S0, T, r, sigma, delta=delta, L=l_adjusted)
+        return eta * v_cont + (1.0 - eta) * S0
+    if L is None:
+        v_cont = pricer(S0, T, r, sigma, delta=delta, L=None)
+        return (v_cont + S0) * (1.0 - corr) - S0
+    l_adjusted = L * eta
+    v_cont = pricer(S0, T, r, sigma, delta=delta, L=l_adjusted)
+    eta_inv = 1.0 / eta
+    return eta_inv * v_cont + (eta_inv - 1.0) * S0
+
+
 # -----------------------------------------------------------------------------
 # European floating-strike lookback call (strike = minimum)
 # Payoff: S_T - min(S_t) = S_T - Y_T. L = current realized minimum (from inception to today).
@@ -119,38 +196,27 @@ def floating_strike_lookback_call(
         raise ValueError("For floating-strike call, running minimum L must satisfy L <= S0")
     if T <= 0:
         return max(S0 - (L if L is not None else S0), 0.0)
-    L_use = S0 if L is None else L
-    b = r - delta
-    expo = 2.0 * b / (sigma**2)
-    log_ratio = log(L_use / S0)
-    sqrt_T = sqrt(T)
-    _d1 = (log(S0 / L_use) + (b + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
-    _d2 = _d1 - sigma * sqrt_T
-    _d3 = _d1 - (2.0 * b / sigma) * sqrt_T
-
-    disc_div = exp(-delta * T)
-    disc_rf = exp(-r * T)
-
-    if abs(b) >= 1e-12:
+    terms = _floating_terms(S0, T, r, sigma, delta, L)
+    if abs(terms.b) >= 1e-12:
         call = (
-            S0 * disc_div * norm_cdf(_d1)
-            - L_use * disc_rf * norm_cdf(_d2)
-            + (sigma**2 / (2.0 * b))
+            S0 * terms.disc_div * norm_cdf(terms.d1)
+            - terms.L_use * terms.disc_rf * norm_cdf(terms.d2)
+            + (sigma**2 / (2.0 * terms.b))
             * S0
             * (
-                disc_div * norm_cdf(-_d1)
-                - disc_rf * exp(expo * log_ratio) * norm_cdf(-_d3)
+                terms.disc_div * norm_cdf(-terms.d1)
+                - terms.disc_rf * exp(terms.expo * terms.log_ratio) * norm_cdf(-terms.d3)
             )
         )
     else:
         call = (
-            S0 * disc_div * norm_cdf(_d1)
-            - L_use * disc_rf * norm_cdf(_d2)
+            S0 * terms.disc_div * norm_cdf(terms.d1)
+            - terms.L_use * terms.disc_rf * norm_cdf(terms.d2)
             + S0
-            * disc_div
+            * terms.disc_div
             * (
-                -sigma * sqrt_T * norm_pdf(_d1)
-                + (0.5 * sigma**2 * T + log(S0 / L_use)) * norm_cdf(-_d1)
+                -sigma * terms.sqrt_T * norm_pdf(terms.d1)
+                + (0.5 * sigma**2 * T + log(S0 / terms.L_use)) * norm_cdf(-terms.d1)
             )
         )
     return call
@@ -183,38 +249,27 @@ def floating_strike_lookback_put(
         raise ValueError("For floating-strike put, running maximum L must satisfy L >= S0")
     if T <= 0:
         return max((L if L is not None else S0) - S0, 0.0)
-    L_use = S0 if L is None else L
-    b = r - delta
-    expo = 2.0 * b / (sigma**2)
-    log_ratio = log(L_use / S0)
-    sqrt_T = sqrt(T)
-    _d1 = (log(S0 / L_use) + (b + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
-    _d2 = _d1 - sigma * sqrt_T
-    _d3 = _d1 - (2.0 * b / sigma) * sqrt_T
-
-    disc_div = exp(-delta * T)
-    disc_rf = exp(-r * T)
-
-    if abs(b) >= 1e-12:
+    terms = _floating_terms(S0, T, r, sigma, delta, L)
+    if abs(terms.b) >= 1e-12:
         put = (
-            -S0 * disc_div * norm_cdf(-_d1)
-            + L_use * disc_rf * norm_cdf(-_d2)
-            + (sigma**2 / (2.0 * b))
+            -S0 * terms.disc_div * norm_cdf(-terms.d1)
+            + terms.L_use * terms.disc_rf * norm_cdf(-terms.d2)
+            + (sigma**2 / (2.0 * terms.b))
             * S0
             * (
-                disc_div * norm_cdf(_d1)
-                - disc_rf * exp(expo * log_ratio) * norm_cdf(_d3)
+                terms.disc_div * norm_cdf(terms.d1)
+                - terms.disc_rf * exp(terms.expo * terms.log_ratio) * norm_cdf(terms.d3)
             )
         )
     else:
         put = (
-            -S0 * disc_div * norm_cdf(-_d1)
-            + L_use * disc_rf * norm_cdf(-_d2)
+            -S0 * terms.disc_div * norm_cdf(-terms.d1)
+            + terms.L_use * terms.disc_rf * norm_cdf(-terms.d2)
             + S0
-            * disc_div
+            * terms.disc_div
             * (
-                sigma * sqrt_T * norm_pdf(_d1)
-                + (0.5 * sigma**2 * T + log(S0 / L_use)) * norm_cdf(_d1)
+                sigma * terms.sqrt_T * norm_pdf(terms.d1)
+                + (0.5 * sigma**2 * T + log(S0 / terms.L_use)) * norm_cdf(terms.d1)
             )
         )
     return put
@@ -237,17 +292,9 @@ def floating_strike_lookback_call_bgk(
     BGK-corrected floating-strike call approximation (Broadie-Glasserman-Kou, 1999).
     Uses Theorem 2 at inception (L is None), and Theorem 3 for in-progress options.
     """
-    _validate_monitoring_points(monitoring_points)
-    if T <= 0:
-        return floating_strike_lookback_call(S0, T, r, sigma, delta=delta, L=L)
-    corr = _BGK_BETA1 * sigma * sqrt(T / monitoring_points)
-    eta = exp(corr)
-    if L is None:
-        v_cont = floating_strike_lookback_call(S0, T, r, sigma, delta=delta, L=None)
-        return (v_cont - S0) * (1.0 + corr) + S0
-    l_adjusted = L / eta
-    v_cont = floating_strike_lookback_call(S0, T, r, sigma, delta=delta, L=l_adjusted)
-    return eta * v_cont + (1.0 - eta) * S0
+    return _floating_strike_bgk(
+        floating_strike_lookback_call, S0, T, r, sigma, monitoring_points, delta, L, is_call=True
+    )
 
 
 def floating_strike_lookback_put_bgk(
@@ -263,18 +310,9 @@ def floating_strike_lookback_put_bgk(
     BGK-corrected floating-strike put approximation (Broadie-Glasserman-Kou, 1999).
     Uses Theorem 2 at inception (L is None), and Theorem 3 for in-progress options.
     """
-    _validate_monitoring_points(monitoring_points)
-    if T <= 0:
-        return floating_strike_lookback_put(S0, T, r, sigma, delta=delta, L=L)
-    corr = _BGK_BETA1 * sigma * sqrt(T / monitoring_points)
-    eta = exp(corr)
-    if L is None:
-        v_cont = floating_strike_lookback_put(S0, T, r, sigma, delta=delta, L=None)
-        return (v_cont + S0) * (1.0 - corr) - S0
-    l_adjusted = L * eta
-    v_cont = floating_strike_lookback_put(S0, T, r, sigma, delta=delta, L=l_adjusted)
-    eta_inv = 1.0 / eta
-    return eta_inv * v_cont + (eta_inv - 1.0) * S0
+    return _floating_strike_bgk(
+        floating_strike_lookback_put, S0, T, r, sigma, monitoring_points, delta, L, is_call=False
+    )
 
 
 def floating_strike_lookback_call_greeks(
